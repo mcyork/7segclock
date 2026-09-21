@@ -57,6 +57,32 @@
 #include "settings.h"
 #include "webui.h"
 #include "geometryui.h"
+#include <esp_system.h>
+
+// POWER DIAGNOSTICS
+//
+// The laptop cannot measure what the board draws -- macOS reports only the USB
+// descriptor's declared bMaxPower, which is a request, not a measurement. But
+// the question is not really "how many mA", it is "is the supply sagging enough
+// to matter", and the ESP32 answers that itself: the brownout detector fires a
+// reset with its own reason code. A counter in NVS makes it visible even if
+// nobody was watching the serial port when it happened.
+inline const char* resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_SW:        return "software";     // our own ESP.restart()
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_wdt";
+    case ESP_RST_TASK_WDT:  return "task_wdt";
+    case ESP_RST_WDT:       return "wdt";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";     // the one that means power
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_EXT:       return "external";
+    default:                return "unknown";
+  }
+}
+uint32_t bootCount = 0, brownoutCount = 0;
+uint8_t  lastStressTry = 0;
 #include "ticker.h"
 
 // ---------------------------------------------------------------- hardware
@@ -64,7 +90,7 @@
 // Brightness now lives in Settings so the web page can change it; this is only
 // the value a virgin device starts at.
 #define BRIGHTNESS   40           // WS2812 at close range; 40 is already bright
-#define MAX_MA       500          // hard ceiling; see note at setMaxPower below
+#define MAX_MA       1200         // in FastLED MODEL units -- see note at setMaxPower
 
 // ---------------------------------------------------------------- behaviour
 #define FW_VERSION   "1.1.0"
@@ -391,16 +417,26 @@ void sendState() {
   if (timeValid && getLocalTime(&t, 50))
     snprintf(clockStr, sizeof clockStr, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
 
-  char buf[640];
+  char buf[780];
   snprintf(buf, sizeof buf,
     "{\"hue\":%u,\"spread\":%u,\"env\":%u,\"secpath\":%u,\"sectrail\":%u,"
     "\"r\":%u,\"g\":%u,\"b\":%u,\"bri\":%u,"
+    "\"rst\":\"%s\",\"boots\":%u,\"brownouts\":%u,\"upMin\":%lu,"
+    "\"estMw\":%lu,\"briCap\":%u,\"diedAt\":%u,"
     "\"h12\":%s,\"colon\":%u,\"speed\":%u,\"tick\":%u,\"cards\":%u,"
     "\"digits\":%u,\"ledsPerSeg\":%u,\"dpMask\":%u,"
     "\"fw\":\"%s\",\"pin\":%u,\"pins\":[%s],\"btc\":%ld,\"tempF\":%.1f,\"city\":\"%s\","
     "\"time\":\"%s\",\"ip\":\"%s\"}",
     cfg.hue, cfg.spread, cfg.env, cfg.secpath, cfg.sectrail,
     cfg.r, cfg.g, cfg.b, cfg.brightness,
+    resetReasonName(), bootCount, brownoutCount, (unsigned long)(millis() / 60000UL),
+    // What FastLED BELIEVES the panel draws with the current buffer at full
+    // brightness, and the brightness its cap would allow. briCap below
+    // cfg.brightness means the display is being throttled -- and FastLED models
+    // 5050-class parts, so on a 2020 panel that throttle is largely spurious.
+    (unsigned long)calculate_unscaled_power_mW(leds, activeLedCount(cfg)),
+    calculate_max_brightness_for_power_mW(leds, activeLedCount(cfg), 255, MAX_MA * 5),
+    lastStressTry,
     cfg.hour12 ? "true" : "false", cfg.colon, cfg.speed, cfg.tickMins, cfg.cards,
     cfg.digits, cfg.ledsPerSeg, cfg.dpMask,
     FW_VERSION, cfg.dataPin, pinListJson().c_str(), btc.usd, btc.wxOk ? btc.tempF : 0.0f, geoCity.c_str(), clockStr,
@@ -776,6 +812,66 @@ void startWeb() {
     delay(200);
     ESP.restart();
   });
+  // Every LED, full white, for a few seconds: the worst case the panel can ever
+  // present. Blocking on purpose -- loop() is not running inside a handler, so
+  // the clock cannot repaint over it and no preview state machine is needed.
+  //
+  // Reports what FastLED BELIEVES it costs and what its cap allowed. If the
+  // board survives this, no display content can brown it out; if it resets, the
+  // brownout counter in /api will say so on the next boot, which is exactly the
+  // evidence a USB power meter would have given.
+  server.on("/stress", [] {
+    long ms = 3000;
+    if (server.hasArg("ms") && !parseLongStrict(server.arg("ms"), ms)) ms = 3000;
+    if (ms < 100) ms = 100;
+    if (ms > 10000) ms = 10000;
+    // ⚠ setMaxPowerInVoltsAndMilliamps makes show() auto-scale, so a plain
+    //   stress run measures the CAP, not the hardware. uncapped=1 lifts it and
+    //   ramps, leaving a breadcrumb in NVS before each step: if the step browns
+    //   the board out it cannot answer, but the next boot can say how far it got.
+    bool uncapped = server.hasArg("uncapped") && server.arg("uncapped") == "1";
+    uint16_t n = activeLedCount(cfg);
+    uint8_t  savedBri = cfg.brightness;
+
+    fill_solid(leds, n, CRGB::White);
+    uint32_t mw  = calculate_unscaled_power_mW(leds, n);
+    uint8_t  cap = calculate_max_brightness_for_power_mW(leds, n, 255, MAX_MA * 5);
+
+    uint8_t reached = 0;
+    if (uncapped) {
+      FastLED.setMaxPowerInVoltsAndMilliamps(5, 100000);   // effectively off
+      Preferences sp;
+      for (uint8_t step : { (uint8_t)64, (uint8_t)128, (uint8_t)192, (uint8_t)255 }) {
+        if (sp.begin("boots", false)) { sp.putUChar("try", step); sp.end(); }
+        FastLED.setBrightness(step);
+        FastLED.show();
+        uint32_t t1 = millis();
+        while (millis() - t1 < 1200UL) { server.handleClient(); delay(5); }
+        reached = step;
+      }
+      if (sp.begin("boots", false)) { sp.putUChar("try", 0); sp.end(); }   // survived
+      FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MA);
+    } else {
+      FastLED.setBrightness(255);
+      FastLED.show();
+      uint32_t t0 = millis();
+      while (millis() - t0 < (uint32_t)ms) { server.handleClient(); delay(5); }
+      reached = cap;
+    }
+
+    FastLED.setBrightness(savedBri);
+    clearDisplay(leds, cfg);
+    FastLED.show();
+
+    char b[260];
+    snprintf(b, sizeof b,
+      "{\"ok\":true,\"leds\":%u,\"heldMs\":%ld,"
+      "\"modelMw\":%lu,\"modelMa\":%lu,\"capBrightness\":%u,\"capMa\":%u,"
+      "\"uncapped\":%s,\"reachedBrightness\":%u,\"survived\":true}",
+      n, ms, (unsigned long)mw, (unsigned long)(mw / 5), cap, MAX_MA,
+      uncapped ? "true" : "false", reached);
+    server.send(200, "application/json", b);
+  });
   server.on("/wiring", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", GEOMETRY_HTML); });
   server.on("/update", HTTP_GET, [] {
     if (!rejectNoArgs()) return;
@@ -954,10 +1050,44 @@ void setup() {
              cfg.dataPin = DEFAULT_DATA_PIN; break;
   }
   FastLED.setBrightness(cfg.brightness);
-  // BRIGHTNESS is a bare knob. At 40 the worst case is ~180 mA; at 255 a white
-  // "88:88" is 32 x 60 mA = 1.9 A through the Super Mini's VBUS trace. This
-  // ceiling makes raising it safe.
+  // ⚠ MAX_MA IS IN FASTLED'S MODEL UNITS, NOT REAL MILLIAMPS.
+  //
+  // FastLED's power model is built for 5050-class WS2812B: about 42 mA per LED
+  // at full white. This panel is WS2812B-**2020** (DESIGN.md:9), a 2 mm part
+  // that draws roughly a third of that -- a 2 mm package cannot dissipate 60 mA.
+  //
+  // The old comment here claimed 32 x 60 mA = 1.9 A and set the ceiling to 500,
+  // which FastLED then honoured by scaling white content down to brightness
+  // 93/255. The display was being throttled to about a third for a part it does
+  // not have.
+  //
+  // MEASURED, 2026-09-21: all 32 LEDs, full white, brightness 255, cap lifted
+  // entirely -- the board did not brown out, boot count did not change, and the
+  // brownout counter stayed at zero. Had it truly been pulling the modelled
+  // 1370 mA, a 500 mA USB port would have collapsed. It did not.
+  //
+  // 1200 model-units therefore maps to something under ~450 mA real, which
+  // leaves full brightness available with the safety net still hanging.
+  // ⚠ A build using 5050 parts MUST lower this -- the model would then be right
+  //   and this ceiling would be three times too generous.
   FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MA);
+
+  // Count boots, and the subset that were brownouts. A brownout nobody watched
+  // is otherwise indistinguishable from a power-cycle after the fact.
+  {
+    Preferences bp;
+    if (bp.begin("boots", false)) {
+      lastStressTry = bp.getUChar("try", 0);   // non-zero => died at this step
+      bootCount = bp.getUInt("n", 0) + 1;
+      brownoutCount = bp.getUInt("bo", 0);
+      if (esp_reset_reason() == ESP_RST_BROWNOUT) brownoutCount++;
+      bp.putUInt("n", bootCount);
+      bp.putUInt("bo", brownoutCount);
+      bp.end();
+    }
+  }
+  Serial.printf("[PWR] boot #%u, reset reason %s, brownouts so far %u\n",
+                bootCount, resetReasonName(), brownoutCount);
   showSpin(0);
 
   WiFi.mode(WIFI_STA);
