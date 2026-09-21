@@ -110,6 +110,15 @@ uint32_t lastReconnectMs = 0;
 uint32_t lastPortalTryMs = 0;
 uint32_t lastSyncMs      = 0;
 Settings cfg;
+
+/** The allow-list as a JSON array, so the settings page renders exactly the
+ *  pins this firmware will actually accept. */
+inline String pinListJson() {
+  String out;
+  for (uint8_t i = 0; i < PIN_COUNT; i++) { if (i) out += ','; out += PIN_LIST[i]; }
+  return out;
+}
+
 Ticker btc;
 String geoCity;
 uint32_t lastTickMs = 0;
@@ -216,15 +225,15 @@ void sendState() {
   if (timeValid && getLocalTime(&t, 50))
     snprintf(clockStr, sizeof clockStr, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
 
-  char buf[470];
+  char buf[560];
   snprintf(buf, sizeof buf,
     "{\"hue\":%u,\"spread\":%u,\"env\":%u,\"secpath\":%u,\"sectrail\":%u,"
     "\"r\":%u,\"g\":%u,\"b\":%u,\"bri\":%u,"
-    "\"h12\":%s,\"colon\":%u,\"speed\":%u,\"tick\":%u,\"cards\":%u,\"fw\":\"%s\",\"btc\":%ld,\"tempF\":%.1f,\"city\":\"%s\","
+    "\"h12\":%s,\"colon\":%u,\"speed\":%u,\"tick\":%u,\"cards\":%u,\"fw\":\"%s\",\"pin\":%u,\"pins\":[%s],\"btc\":%ld,\"tempF\":%.1f,\"city\":\"%s\","
     "\"time\":\"%s\",\"ip\":\"%s\"}",
     cfg.hue, cfg.spread, cfg.env, cfg.secpath, cfg.sectrail,
     cfg.r, cfg.g, cfg.b, cfg.brightness,
-    cfg.hour12 ? "true" : "false", cfg.colon, cfg.speed, cfg.tickMins, cfg.cards, FW_VERSION, btc.usd, btc.wxOk ? btc.tempF : 0.0f, geoCity.c_str(), clockStr,
+    cfg.hour12 ? "true" : "false", cfg.colon, cfg.speed, cfg.tickMins, cfg.cards, FW_VERSION, cfg.dataPin, pinListJson().c_str(), btc.usd, btc.wxOk ? btc.tempF : 0.0f, geoCity.c_str(), clockStr,
     WiFi.localIP().toString().c_str());
   server.send(200, "application/json", buf);
 }
@@ -252,6 +261,13 @@ void handleSet() {
   cfg.speed      = argU8("speed", cfg.speed, 1, 20);
   cfg.tickMins   = argU8("tick",  cfg.tickMins, 0, 60);
   cfg.cards      = argU8("cards", cfg.cards, 0, 3);
+  // Validated against the allow-list, not just a range: an arbitrary pin would
+  // fall through to the default and silently keep using 4, which looks like the
+  // setting simply does not work.
+  if (server.hasArg("pin")) {
+    uint8_t want = server.arg("pin").toInt();
+    for (uint8_t p : PIN_LIST) if (p == want) { cfg.dataPin = want; break; }
+  }
   if (server.hasArg("h12")) cfg.hour12 = server.arg("h12").toInt() != 0;
 
   FastLED.setBrightness(cfg.brightness);
@@ -369,6 +385,14 @@ void startWeb() {
   server.on("/api",  sendState);
   server.on("/set",  handleSet);
   server.on("/save", HTTP_POST, handleSave);
+  // Deliberately POST: a GET /reboot would be followed by any link prefetcher
+  // or crawler that ever saw the page, and rebooting the clock by accident is
+  // a rotten way to find that out.
+  server.on("/reboot", HTTP_POST, [] {
+    server.send(200, "application/json", "{\"ok\":true}");
+    delay(200);
+    ESP.restart();
+  });
   server.on("/update", HTTP_GET, [] { server.send_P(200, "text/html", UPDATE_HTML); });
   server.on("/checkupdate", [] {
     bool ok = checkUpdate();
@@ -525,7 +549,20 @@ void setup() {
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 2000) delay(10);
 
-  FastLED.addLeds<WS2812, DATA_PIN, GRB>(leds, NUM_LEDS);
+  // FastLED takes the pin as a TEMPLATE parameter, not an argument — the
+  // clockless driver's bit timing is generated at compile time. So a runtime
+  // pin means instantiating the driver once per candidate and picking here,
+  // and changing the setting needs a reboot. There is no way around it short
+  // of hand-rolling the RMT setup.
+  switch (cfg.dataPin) {
+#define X(n) case n: FastLED.addLeds<WS2812, n, GRB>(leds, NUM_LEDS); break;
+    PIN_XLIST
+#undef X
+    // Unreachable via /set, which validates against PIN_LIST — but NVS can hold
+    // a pin from a build for a different chip, so it has to land somewhere.
+    default: FastLED.addLeds<WS2812, DEFAULT_DATA_PIN, GRB>(leds, NUM_LEDS);
+             cfg.dataPin = DEFAULT_DATA_PIN; break;
+  }
   loadSettings(cfg);                 // defaults until the page has been used
   FastLED.setBrightness(cfg.brightness);
   // BRIGHTNESS is a bare knob. At 40 the worst case is ~180 mA; at 255 a white

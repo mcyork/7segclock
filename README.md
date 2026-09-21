@@ -2,7 +2,11 @@
 
 An NTP clock on four WS2812 seven-segment digits, driven by an ESP32-C3 Super Mini.
 
-**[Install it from the browser →](https://mcyork.github.io/7segclock/)** (Chrome or Edge)
+**[Install it from the browser →](https://mcyork.github.io/7segclock/)**
+
+Chrome or Edge on a desktop. The installer uses Web Serial, which Safari and
+Firefox do not implement — on those the install button does not appear at all,
+rather than appearing and failing.
 
 ## What it does
 
@@ -57,14 +61,94 @@ Three wires from the C3, all on one edge:
 | `G` | `H1 G` |
 | `GPIO4` | `H1 DI` |
 
-GPIO4 is deliberate: on the C3, GPIO2/8/9 are strapping pins sampled at reset,
-and a WS2812 line idles low — tying a strapping pin to one can put the chip in
-download mode at power-up, which presents as a dead board.
+### The data pin is settable
+
+`GPIO4` is only the default. The settings page has a **Hardware** section
+listing every pin this firmware will drive, so you can solder to whatever is
+convenient on your board and select it afterwards. It takes effect on restart,
+and the page offers you the restart button once you pick one.
+
+The list is shorter than the pin count, deliberately. Strapping pins — sampled
+at reset to choose the boot mode — are withheld rather than warned about,
+because a WS2812 line idles low, so a strapping pin wired to one can hold the
+part in download mode at power-up. That presents as a board that is simply
+dead, which is a miserable thing to debug. On the C3 those are GPIO2, 8 and 9.
+The USB D+/D− pair, the SPI flash bus and UART0 are withheld for the same
+reason: the failure is silent.
+
+The list lives in exactly one place, `src/settings.h`:
+
+```c
+#define PIN_XLIST  X(0) X(1) X(3) X(4) X(5) X(6) X(7) X(10)
+```
+
+An X-macro, because two consumers derive from it — the array `/api` publishes
+and the `switch` that instantiates FastLED. **FastLED takes the pin as a
+template parameter, not an argument**, since the clockless driver's bit timing
+is generated at compile time. So "settable at runtime" really means one driver
+instantiated per candidate pin and a `switch` at boot, which is why the change
+needs a restart, and why the page renders whatever the device reports instead of
+carrying its own copy of the list.
 
 ⚠️ WS2812 wants V_IH = 3.5 V and a C3 pin gives 3.3 V. It usually works, which
 is what makes it awkward: the failure is intermittent and tracks temperature and
 lead length. Fixes, cheapest first — a series Schottky in the LED 5 V feed, a
 74AHCT125, or a sacrificial first pixel.
+
+## Which ESP32s this runs on
+
+The source is portable; the **binary is not**. ESP32 parts come in two
+instruction sets, and a build for one cannot run on the other under any
+circumstances — it is a recompile, not a config flag:
+
+| ISA | parts |
+|---|---|
+| RISC-V | **C3**, C6, C2, H2 |
+| Xtensa | ESP32 classic, S2, S3 |
+
+The firmware itself needs almost nothing: wifi, one GPIO, and about 1.4 MB of
+app. Built unmodified against three other targets, all clean:
+
+| target | flash used (of 1.92 MB OTA slot) | status |
+|---|---|---|
+| ESP32-C3 | 69.7% | **shipped and tested on hardware** |
+| ESP32-C6 | 71.9% | compiles; untested on silicon |
+| ESP32-S3 | 78.3% | compiles; untested on silicon |
+| ESP32 classic | fails to build | see below |
+
+So the browser installer can gain other chips cheaply when there is hardware to
+verify them on: one more PlatformIO env, one more `builds` entry in
+`manifest.json`, and ESP Web Tools picks the right image by reading the chip ID
+off the board. Only the C3 image is offered today because it is the only one
+that has been run.
+
+### Why the classic ESP32 is a different class, not just another target
+
+It fails on `ARDUINO_USB_CDC_ON_BOOT`, and that is the whole story rather than a
+build detail. The classic ESP32 and S2 have no USB-Serial-JTAG peripheral, so
+boards carry a CH340 or CP2102 bridge — which means a driver install on some
+machines, and the "plug it in and flash it from a web page" story is gone. The
+C3/C6/S3 enumerate as USB devices on their own.
+
+### Is the C3 Super Mini a good class of machine for this?
+
+Yes, and for reasons that are specific to this build rather than general
+enthusiasm:
+
+- **Native USB.** No bridge chip, no drivers, so one-click browser flashing
+  actually works for someone who has never installed a toolchain.
+- **It fits behind the panel.** 22.5 × 18 mm is what lets the enclosure be as
+  shallow as it is; an S3 devkit would set the case depth instead.
+- **4 MB flash** takes two 1.92 MB OTA slots with ~30% headroom, so the clock
+  can update itself.
+- **~$2.** It is the cheapest part that does all of the above.
+
+What you give up is GPIO count and the second core, neither of which this uses,
+and a slightly awkward 3.3 V against the WS2812 threshold — which the S3 shares
+anyway. The C6 is the natural successor if WiFi 6 or Thread ever matters here;
+today it costs more and buys nothing. Adding chips beyond that is not obviously
+worth it: the marginal one is a build env and a manifest entry, but each also
+needs its own verified pin allow-list and a board on the bench.
 
 ## Updating
 

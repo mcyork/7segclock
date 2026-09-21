@@ -79,6 +79,11 @@ input[type=color]{width:3.2rem;height:2.1rem;padding:0;border:1px solid var(--li
 <p class=note id=btcn style="border:0;padding:0;margin:.2rem 0 0"></p>
 </fieldset>
 
+<fieldset><legend>Hardware &mdash; LED data pin</legend>
+<div class=modes id=pin></div>
+<p class=note id=pinn style="border:0;padding:0;margin:.5rem 0 0"></p>
+</fieldset>
+
 <fieldset><legend>Firmware</legend>
 <div class=row><label>Version</label><output id=fwv></output></div>
 <div class=seg><button id=chk>Check for updates</button></div>
@@ -112,6 +117,17 @@ function paint(d){S=d;
      d.tempF?(d.tempF.toFixed(1)+'\u00b0F'+(d.city?' in '+d.city:'')):'temp not fetched'].join('  \u00b7  ');
   $('stat').textContent=d.time+'  ·  '+d.ip;
   $('fwv').textContent=d.fw;
+  // Built once from the value the firmware reports, not hard-coded here: the
+  // allow-list lives in settings.h next to the switch that implements it, and
+  // two copies of it would eventually disagree.
+  if(!$('pin').children.length)
+    $('pin').innerHTML=(d.pins||[]).map(p=>'<button data-v='+p+'>GPIO '+p+'</button>').join('');
+  [...$('pin').children].forEach(b=>b.setAttribute('aria-pressed',+b.dataset.v===d.pin));
+  $('pinn').innerHTML='Currently <b>GPIO '+d.pin+'</b>. Changing it takes effect on '+
+    'restart. Only pins this chip can safely drive are listed \u2014 strapping pins '+
+    'are withheld, because they are read at reset to decide how the chip boots and '+
+    'a WS2812 line idles low, which can hold the board in download mode and look '+
+    'exactly like a dead clock.';
   // Colour and speed only do anything in the modes that read them. Saying so
   // beats greying controls out and leaving people guessing why.
   const hue={0:'<b>Fixed</b> — the colour you pick.',
@@ -140,6 +156,17 @@ $('bri').oninput=e=>{$('briv').textContent=e.target.value;send({bri:+e.target.va
 $('spd').oninput=e=>{$('spdv').textContent=e.target.value;send({speed:+e.target.value})};
 $('tick').oninput=e=>{$('tickv').textContent=e.target.value>0?e.target.value+' min':'off';send({tick:+e.target.value})};
 $('cards').onclick=e=>{const v=+e.target.dataset.v;if(v)send({cards:S.cards^v})};
+$('pin').onclick=e=>{const v=e.target.dataset.v;if(v===undefined)return;
+  send({pin:+v});
+  const n=$('pinn');
+  const b=document.createElement('button');
+  b.textContent='Restart now to use GPIO '+v;
+  b.style.cssText='display:block;width:100%;margin-top:.6rem;padding:.5rem;'+
+    'border:1px solid var(--acc);background:#151920;color:var(--acc);border-radius:.4rem;font:inherit;cursor:pointer';
+  b.onclick=()=>{b.textContent='Restarting\u2026';
+    fetch('/reboot',{method:'POST'}).catch(()=>{});
+    setTimeout(()=>location.reload(),4000);};
+  n.appendChild(b);};
 $('chk').onclick=()=>{const n=$('fwn');n.textContent='Checking…';
   fetch('/checkupdate').then(r=>r.json()).then(u=>{
     if(!u.ok){n.textContent='Could not reach GitHub.';return}

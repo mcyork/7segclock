@@ -21,6 +21,48 @@
 #include <FastLED.h>
 #include <sys/time.h>
 
+// Pins offered for the LED data line, per chip.
+//
+// The list is NOT cosmetic. Every chip has strapping pins — sampled at reset to
+// choose the boot mode — and a WS2812 line idles low, so a strapping pin wired
+// to one can hold the part in download mode at power-up. That failure looks
+// exactly like a dead board, which is why these pins are withheld rather than
+// merely warned about.
+//
+// Withheld everywhere: strapping pins, the USB D+/D- pair, the SPI flash bus,
+// and the UART0 pair (usable here, since Serial runs over USB CDC, but they are
+// what a serial adapter would want back).
+//
+// ⚠ One list, one owner. The web page renders whatever /api reports and has no
+//   copy of its own — an allow-list duplicated into the JS would drift the first
+//   time a chip was added, and the UI would offer pins the firmware refuses.
+// An X-macro, so the list is written ONCE and both consumers derive from it:
+// the array /api publishes, and the switch that instantiates FastLED. Writing
+// the switch out separately is the obvious alternative and it is a trap — the
+// two copies stay in step exactly until someone adds a chip.
+#if   defined(CONFIG_IDF_TARGET_ESP32C3)
+  #define PIN_XLIST  X(0) X(1) X(3) X(4) X(5) X(6) X(7) X(10)
+  #define DEFAULT_DATA_PIN 4                  // strapping: 2, 8, 9
+#elif defined(CONFIG_IDF_TARGET_ESP32C6)
+  #define PIN_XLIST  X(0) X(1) X(2) X(3) X(6) X(7) X(10) X(11) X(18) X(19)
+  #define DEFAULT_DATA_PIN 2                  // strapping: 4, 5, 8, 9, 15
+#elif defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S2)
+  #define PIN_XLIST  X(1) X(2) X(4) X(5) X(6) X(7) X(8) X(9) X(10) \
+                     X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(21)
+  #define DEFAULT_DATA_PIN 4                  // strapping: 0, 3, 45, 46; USB: 19, 20
+#elif defined(CONFIG_IDF_TARGET_ESP32)
+  #define PIN_XLIST  X(4) X(5) X(13) X(14) X(16) X(17) X(18) X(19) \
+                     X(21) X(22) X(23) X(25) X(26) X(27) X(32) X(33)
+  #define DEFAULT_DATA_PIN 4                  // strapping: 0, 2, 5, 12, 15
+#else
+  #error "No LED pin allow-list for this chip. Add one rather than guessing."
+#endif
+
+#define X(n) n,
+static constexpr uint8_t PIN_LIST[] = { PIN_XLIST };
+#undef X
+static constexpr uint8_t PIN_COUNT = sizeof(PIN_LIST);
+
 enum Hue    : uint8_t { HUE_FIXED = 0, HUE_CYCLE, HUE_CHRONO, HUE_COUNT };
 enum Env    : uint8_t { ENV_NONE  = 0, ENV_BREATHE, ENV_COUNT };
 enum Colon  : uint8_t { COLON_BLINK = 0, COLON_ON, COLON_OFF };
@@ -45,6 +87,7 @@ struct Settings {
   uint8_t tickMins   = 0;      // 0 = ticker off, else show the cards every N min
   uint8_t cards      = 0x03;   // bitmask: 1 = bitcoin, 2 = temperature
   float   lat        = 0, lon = 0;   // 0,0 = not located yet (and no clocks live there)
+  uint8_t dataPin    = DEFAULT_DATA_PIN;   // see PIN_XLIST — changing needs a reboot
 };
 
 inline void loadSettings(Settings& s) {
@@ -93,6 +136,7 @@ inline void loadSettings(Settings& s) {
   s.cards      = p.getUChar("cards", s.cards);
   s.lat        = p.getFloat("lat",   s.lat);
   s.lon        = p.getFloat("lon",   s.lon);
+  s.dataPin    = p.getUChar("pin",   s.dataPin);
   p.end();
 }
 
@@ -111,6 +155,7 @@ inline bool saveSettings(const Settings& s) {
          && p.putUChar("tick",  s.tickMins)
          && p.putUChar("cards", s.cards);
   p.putFloat("lat", s.lat); p.putFloat("lon", s.lon);
+  p.putUChar("pin", s.dataPin);
   p.putBool("h12", s.hour12);              // 0 is a legal size for `false`
   p.end();
   return ok;

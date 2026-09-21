@@ -17,7 +17,6 @@ code{background:#151920;padding:.12rem .38rem;border-radius:.25rem;font-size:.88
 a{color:var(--acc)}
 .card{background:#12161c;border:1px solid var(--line);border-radius:.7rem;
       padding:1.4rem;margin:0 0 1.5rem}
-.warn{border-left:2px solid #d08f3c;padding-left:.9rem;color:var(--mut);font-size:.9rem}
 /* Background accent, text dark. Both were set to #04121d, which rendered the
    button as dark-on-dark and effectively invisible. */
 esp-web-install-button{--esp-tools-button-color:var(--acc);
@@ -33,8 +32,6 @@ ESP32-C3 Super Mini. Flash it from this page — no toolchain, no drivers.</p>
 
 <div class=card>
   <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
-  <p class=warn style="margin-top:1rem">Needs Chrome or Edge on a desktop.
-  Safari and Firefox have no Web Serial, and this will not appear there.</p>
 </div>
 
 <h2>After flashing</h2>
@@ -54,19 +51,16 @@ ESP32-C3 Super Mini. Flash it from this page — no toolchain, no drivers.</p>
   <li><code>G</code> &rarr; panel <code>H1 G</code></li>
   <li><code>GPIO4</code> &rarr; panel <code>H1 DI</code></li>
 </ol>
-<p class=warn>GPIO4 is not arbitrary. On the C3, GPIO2, 8 and 9 are strapping
-pins read at reset to pick the boot mode, and a WS2812 data line idles low — a
-strapping pin tied to one can drop the chip into download mode at power-up,
-which looks exactly like a dead board.</p>
+<p>Any pin the settings page offers will do — GPIO4 is just the default. Solder
+to whichever is convenient and pick it under <b>Hardware</b>.</p>
 
 <h2>Updating later</h2>
 <p>You do not need this page to update &mdash; the clock can do it itself. Open
 <code>mini7seg.local</code>, and under <b>Firmware</b> press
 <b>Check for updates</b>. If there is a newer build it will fetch and install it
 on its own.</p>
-<p class=warn>This page is still the one you want for a <i>new</i> device, or to
-recover one that will not boot &mdash; those need a cable and a full factory
-image, which a running clock cannot install on itself.</p>
+<p>This page is still the one you want for a <i>new</i> device, or to recover one
+that will not boot.</p>
 
 <p style="margin-top:3rem"><a href="https://github.com/mcyork/7segclock">Source on GitHub</a></p>
 </div>
