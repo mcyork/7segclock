@@ -47,6 +47,7 @@
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <Update.h>
+#include <HTTPUpdate.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
@@ -67,6 +68,14 @@
 #define MAX_MA       500          // hard ceiling; see note at setMaxPower below
 
 // ---------------------------------------------------------------- behaviour
+#define FW_VERSION   "1.0.0"
+// Self-update straight from GitHub Releases. The /latest/download/ path always
+// resolves to the newest release's asset, so the device needs no version file
+// to be maintained alongside the binary — the release IS the manifest.
+#define GH_REPO      "mcyork/7segclock"
+#define GH_LATEST    "https://api.github.com/repos/" GH_REPO "/releases/latest"
+#define GH_BIN       "https://github.com/" GH_REPO "/releases/latest/download/firmware.bin"
+
 #define HOSTNAME     "mini7seg"   // -> http://mini7seg.local/
 #define AP_SSID      "mini7seg-clock"
 #define AP_PASSWORD  "sevenseg"   // >= 8 chars or the AP silently refuses to start
@@ -207,15 +216,15 @@ void sendState() {
   if (timeValid && getLocalTime(&t, 50))
     snprintf(clockStr, sizeof clockStr, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
 
-  char buf[420];
+  char buf[470];
   snprintf(buf, sizeof buf,
     "{\"hue\":%u,\"spread\":%u,\"env\":%u,\"secpath\":%u,\"sectrail\":%u,"
     "\"r\":%u,\"g\":%u,\"b\":%u,\"bri\":%u,"
-    "\"h12\":%s,\"colon\":%u,\"speed\":%u,\"tick\":%u,\"cards\":%u,\"btc\":%ld,\"tempF\":%.1f,\"city\":\"%s\","
+    "\"h12\":%s,\"colon\":%u,\"speed\":%u,\"tick\":%u,\"cards\":%u,\"fw\":\"%s\",\"btc\":%ld,\"tempF\":%.1f,\"city\":\"%s\","
     "\"time\":\"%s\",\"ip\":\"%s\"}",
     cfg.hue, cfg.spread, cfg.env, cfg.secpath, cfg.sectrail,
     cfg.r, cfg.g, cfg.b, cfg.brightness,
-    cfg.hour12 ? "true" : "false", cfg.colon, cfg.speed, cfg.tickMins, cfg.cards, btc.usd, btc.wxOk ? btc.tempF : 0.0f, geoCity.c_str(), clockStr,
+    cfg.hour12 ? "true" : "false", cfg.colon, cfg.speed, cfg.tickMins, cfg.cards, FW_VERSION, btc.usd, btc.wxOk ? btc.tempF : 0.0f, geoCity.c_str(), clockStr,
     WiFi.localIP().toString().c_str());
   server.send(200, "application/json", buf);
 }
@@ -325,6 +334,34 @@ void handleUpdateUpload() {
   }
 }
 
+String latestTag;          // "" until a check has run
+
+/** Compare dotted versions numerically. "1.10.0" is NEWER than "1.9.0", which a
+ *  string compare gets exactly backwards — the usual way this goes wrong. */
+inline bool isNewer(const String& a, const String& b) {
+  int ai = 0, bi = 0;
+  for (uint8_t part = 0; part < 3; part++) {
+    long av = a.substring(ai).toInt(), bv = b.substring(bi).toInt();
+    if (av != bv) return av > bv;
+    ai = a.indexOf('.', ai) + 1; bi = b.indexOf('.', bi) + 1;
+    if (ai <= 0 || bi <= 0) break;
+  }
+  return false;
+}
+
+/** Ask GitHub for the newest release tag. Keyless: public repos allow 60
+ *  unauthenticated calls an hour per IP, and this runs at most daily. */
+bool checkUpdate() {
+  String b = httpGet(GH_LATEST, true);
+  int k = b.indexOf("\"tag_name\":\"");
+  if (k < 0) return false;
+  int e = b.indexOf('"', k + 12);
+  latestTag = b.substring(k + 12, e);
+  if (latestTag.startsWith("v")) latestTag = latestTag.substring(1);
+  Serial.printf("[UPD] running %s, latest %s\n", FW_VERSION, latestTag.c_str());
+  return true;
+}
+
 void startWeb() {
   if (webUp) return;
   webUp = true;
@@ -333,6 +370,30 @@ void startWeb() {
   server.on("/set",  handleSet);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/update", HTTP_GET, [] { server.send_P(200, "text/html", UPDATE_HTML); });
+  server.on("/checkupdate", [] {
+    bool ok = checkUpdate();
+    char b[160];
+    snprintf(b, sizeof b, "{\"ok\":%s,\"current\":\"%s\",\"latest\":\"%s\",\"newer\":%s}",
+             ok ? "true" : "false", FW_VERSION, latestTag.c_str(),
+             (ok && isNewer(latestTag, FW_VERSION)) ? "true" : "false");
+    server.send(200, "application/json", b);
+  });
+  server.on("/doupdate", [] {
+    // Reply BEFORE flashing: the download takes ~20 s and the connection would
+    // otherwise time out, leaving the page unable to say whether it worked.
+    server.send(200, "application/json", "{\"started\":true}");
+    server.client().stop();
+    showWord("oTA");
+    WiFiClientSecure tls; tls.setInsecure();
+    httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GH redirects to its CDN
+    httpUpdate.rebootOnUpdate(true);
+    t_httpUpdate_return r = httpUpdate.update(tls, GH_BIN);
+    if (r == HTTP_UPDATE_FAILED) {
+      Serial.printf("[UPD] failed %d: %s\n", httpUpdate.getLastError(),
+                    httpUpdate.getLastErrorString().c_str());
+      showWord("Err");
+    }
+  });
   // Two handlers: the second streams the file, the first replies once it is in.
   server.on("/update", HTTP_POST,
     [] {

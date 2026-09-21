@@ -66,6 +66,26 @@ is what makes it awkward: the failure is intermittent and tracks temperature and
 lead length. Fixes, cheapest first — a series Schottky in the LED 5 V feed, a
 74AHCT125, or a sacrificial first pixel.
 
+## Updating
+
+A clock already on your network updates itself: open `mini7seg.local`, press
+**Check for updates** under Firmware. It asks GitHub for the newest release tag,
+compares it to what it is running, and pulls
+`releases/latest/download/firmware.bin` if there is something newer.
+
+The browser installer at [mcyork.github.io/7segclock](https://mcyork.github.io/7segclock/)
+is for a *new* device, or one that will not boot — those need a cable and a full
+factory image, which a running clock cannot install on itself.
+
+### Why the two binaries live in different places
+
+| file | where | why |
+|---|---|---|
+| `firmware.bin` | GitHub Releases | the device fetches it directly; an ESP32 is not a browser, so CORS does not apply |
+| `firmware.factory.bin` | `docs/` in this repo | ESP Web Tools fetches it **from the browser**, and GitHub release assets send no `access-control-allow-origin` header — a cross-origin fetch is blocked, so this one has to be same-origin with the install page |
+
+That asymmetry is not tidiness, it is the only arrangement that works.
+
 ## Build
 
 ```

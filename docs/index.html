@@ -18,8 +18,12 @@ a{color:var(--acc)}
 .card{background:#12161c;border:1px solid var(--line);border-radius:.7rem;
       padding:1.4rem;margin:0 0 1.5rem}
 .warn{border-left:2px solid #d08f3c;padding-left:.9rem;color:var(--mut);font-size:.9rem}
-esp-web-install-button{--esp-tools-button-color:#04121d;
+/* Background accent, text dark. Both were set to #04121d, which rendered the
+   button as dark-on-dark and effectively invisible. */
+esp-web-install-button{--esp-tools-button-color:var(--acc);
                        --esp-tools-button-text-color:#04121d}
+esp-web-install-button::part(button){padding:.8rem 1.4rem;border-radius:.45rem;
+  font:600 1rem system-ui;cursor:pointer}
 </style>
 
 <div class=w>
@@ -56,12 +60,13 @@ strapping pin tied to one can drop the chip into download mode at power-up,
 which looks exactly like a dead board.</p>
 
 <h2>Updating later</h2>
-<p>Once it is on your network you never need this page again: go to
-<code>mini7seg.local/update</code> and upload <code>firmware.bin</code>.</p>
-<p class=warn>That is <code>firmware.bin</code>, not
-<code>firmware.factory.bin</code>. The factory image carries the bootloader and
-partition table for a first flash over USB; sending it as an OTA payload writes
-a bootloader into an app slot.</p>
+<p>You do not need this page to update &mdash; the clock can do it itself. Open
+<code>mini7seg.local</code>, and under <b>Firmware</b> press
+<b>Check for updates</b>. If there is a newer build it will fetch and install it
+on its own.</p>
+<p class=warn>This page is still the one you want for a <i>new</i> device, or to
+recover one that will not boot &mdash; those need a cable and a full factory
+image, which a running clock cannot install on itself.</p>
 
 <p style="margin-top:3rem"><a href="https://github.com/mcyork/7segclock">Source on GitHub</a></p>
 </div>

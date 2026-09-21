@@ -79,8 +79,14 @@ input[type=color]{width:3.2rem;height:2.1rem;padding:0;border:1px solid var(--li
 <p class=note id=btcn style="border:0;padding:0;margin:.2rem 0 0"></p>
 </fieldset>
 
+<fieldset><legend>Firmware</legend>
+<div class=row><label>Version</label><output id=fwv></output></div>
+<div class=seg><button id=chk>Check for updates</button></div>
+<p class=note id=fwn style="border:0;padding:0;margin:.4rem 0 0"></p>
+</fieldset>
+
 <p class=note id=note></p>
-<p class=note style="border:0"><a href="/update" style="color:var(--acc)">Firmware update &rarr;</a></p>
+<p class=note style="border:0"><a href="/update" style="color:var(--acc)">Upload a .bin manually &rarr;</a></p>
 </div>
 <script>
 let S={};
@@ -105,6 +111,7 @@ function paint(d){S=d;
     [d.btc?('BTC $'+d.btc.toLocaleString()):'BTC not fetched',
      d.tempF?(d.tempF.toFixed(1)+'\u00b0F'+(d.city?' in '+d.city:'')):'temp not fetched'].join('  \u00b7  ');
   $('stat').textContent=d.time+'  ·  '+d.ip;
+  $('fwv').textContent=d.fw;
   // Colour and speed only do anything in the modes that read them. Saying so
   // beats greying controls out and leaving people guessing why.
   const hue={0:'<b>Fixed</b> — the colour you pick.',
@@ -133,6 +140,17 @@ $('bri').oninput=e=>{$('briv').textContent=e.target.value;send({bri:+e.target.va
 $('spd').oninput=e=>{$('spdv').textContent=e.target.value;send({speed:+e.target.value})};
 $('tick').oninput=e=>{$('tickv').textContent=e.target.value>0?e.target.value+' min':'off';send({tick:+e.target.value})};
 $('cards').onclick=e=>{const v=+e.target.dataset.v;if(v)send({cards:S.cards^v})};
+$('chk').onclick=()=>{const n=$('fwn');n.textContent='Checking…';
+  fetch('/checkupdate').then(r=>r.json()).then(u=>{
+    if(!u.ok){n.textContent='Could not reach GitHub.';return}
+    if(!u.newer){n.textContent='Up to date ('+u.current+').';return}
+    n.innerHTML='Version <b>'+u.latest+'</b> available. ';
+    const b=document.createElement('button');b.textContent='Install now';
+    b.style.cssText='width:auto;padding:.4rem .8rem;margin-left:.4rem';
+    b.onclick=()=>{n.textContent='Downloading and installing — about 30 s. '+
+      'The clock will restart on its own; do not power it off.';
+      fetch('/doupdate').catch(()=>{});};
+    n.appendChild(b);});};
 fetch('/api').then(r=>r.json()).then(paint);
 setInterval(()=>fetch('/api').then(r=>r.json()).then(d=>{
   $('stat').textContent=d.time+'  ·  '+d.ip;}),10000);
