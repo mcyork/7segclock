@@ -90,7 +90,6 @@ uint8_t  lastStressTry = 0;
 // Brightness now lives in Settings so the web page can change it; this is only
 // the value a virgin device starts at.
 #define BRIGHTNESS   40           // WS2812 at close range; 40 is already bright
-#define MAX_MA       1200         // in FastLED MODEL units -- see note at setMaxPower
 
 // ---------------------------------------------------------------- behaviour
 #define FW_VERSION   "1.1.0"
@@ -422,7 +421,7 @@ void sendState() {
     "{\"hue\":%u,\"spread\":%u,\"env\":%u,\"secpath\":%u,\"sectrail\":%u,"
     "\"r\":%u,\"g\":%u,\"b\":%u,\"bri\":%u,"
     "\"rst\":\"%s\",\"boots\":%u,\"brownouts\":%u,\"upMin\":%lu,"
-    "\"estMw\":%lu,\"briCap\":%u,\"diedAt\":%u,"
+    "\"estMw\":%lu,\"diedAt\":%u,"
     "\"h12\":%s,\"colon\":%u,\"speed\":%u,\"tick\":%u,\"cards\":%u,"
     "\"digits\":%u,\"ledsPerSeg\":%u,\"dpMask\":%u,"
     "\"fw\":\"%s\",\"pin\":%u,\"pins\":[%s],\"btc\":%ld,\"tempF\":%.1f,\"city\":\"%s\","
@@ -435,7 +434,6 @@ void sendState() {
     // cfg.brightness means the display is being throttled -- and FastLED models
     // 5050-class parts, so on a 2020 panel that throttle is largely spurious.
     (unsigned long)calculate_unscaled_power_mW(leds, activeLedCount(cfg)),
-    calculate_max_brightness_for_power_mW(leds, activeLedCount(cfg), 255, MAX_MA * 5),
     lastStressTry,
     cfg.hour12 ? "true" : "false", cfg.colon, cfg.speed, cfg.tickMins, cfg.cards,
     cfg.digits, cfg.ledsPerSeg, cfg.dpMask,
@@ -825,39 +823,27 @@ void startWeb() {
     if (server.hasArg("ms") && !parseLongStrict(server.arg("ms"), ms)) ms = 3000;
     if (ms < 100) ms = 100;
     if (ms > 10000) ms = 10000;
-    // ⚠ setMaxPowerInVoltsAndMilliamps makes show() auto-scale, so a plain
-    //   stress run measures the CAP, not the hardware. uncapped=1 lifts it and
-    //   ramps, leaving a breadcrumb in NVS before each step: if the step browns
-    //   the board out it cannot answer, but the next boot can say how far it got.
-    bool uncapped = server.hasArg("uncapped") && server.arg("uncapped") == "1";
+    // No limiter any more, so this is the genuine worst case. It ramps and
+    // leaves a breadcrumb in NVS before each step: a step that browns the board
+    // out cannot answer, but the next boot can say how far it got.
     uint16_t n = activeLedCount(cfg);
     uint8_t  savedBri = cfg.brightness;
 
     fill_solid(leds, n, CRGB::White);
     uint32_t mw  = calculate_unscaled_power_mW(leds, n);
-    uint8_t  cap = calculate_max_brightness_for_power_mW(leds, n, 255, MAX_MA * 5);
+
 
     uint8_t reached = 0;
-    if (uncapped) {
-      FastLED.setMaxPowerInVoltsAndMilliamps(5, 100000);   // effectively off
-      Preferences sp;
-      for (uint8_t step : { (uint8_t)64, (uint8_t)128, (uint8_t)192, (uint8_t)255 }) {
-        if (sp.begin("boots", false)) { sp.putUChar("try", step); sp.end(); }
-        FastLED.setBrightness(step);
-        FastLED.show();
-        uint32_t t1 = millis();
-        while (millis() - t1 < 1200UL) { server.handleClient(); delay(5); }
-        reached = step;
-      }
-      if (sp.begin("boots", false)) { sp.putUChar("try", 0); sp.end(); }   // survived
-      FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MA);
-    } else {
-      FastLED.setBrightness(255);
+    Preferences sp;
+    for (uint8_t step : { (uint8_t)64, (uint8_t)128, (uint8_t)192, (uint8_t)255 }) {
+      if (sp.begin("boots", false)) { sp.putUChar("try", step); sp.end(); }
+      FastLED.setBrightness(step);
       FastLED.show();
-      uint32_t t0 = millis();
-      while (millis() - t0 < (uint32_t)ms) { server.handleClient(); delay(5); }
-      reached = cap;
+      uint32_t t1 = millis();
+      while (millis() - t1 < (uint32_t)ms / 4) { server.handleClient(); delay(5); }
+      reached = step;
     }
+    if (sp.begin("boots", false)) { sp.putUChar("try", 0); sp.end(); }   // survived
 
     FastLED.setBrightness(savedBri);
     clearDisplay(leds, cfg);
@@ -866,10 +852,9 @@ void startWeb() {
     char b[260];
     snprintf(b, sizeof b,
       "{\"ok\":true,\"leds\":%u,\"heldMs\":%ld,"
-      "\"modelMw\":%lu,\"modelMa\":%lu,\"capBrightness\":%u,\"capMa\":%u,"
-      "\"uncapped\":%s,\"reachedBrightness\":%u,\"survived\":true}",
-      n, ms, (unsigned long)mw, (unsigned long)(mw / 5), cap, MAX_MA,
-      uncapped ? "true" : "false", reached);
+      "\"modelMw\":%lu,\"modelMa\":%lu,"
+      "\"reachedBrightness\":%u,\"survived\":true}",
+      n, ms, (unsigned long)mw, (unsigned long)(mw / 5), reached);
     server.send(200, "application/json", b);
   });
   server.on("/wiring", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", GEOMETRY_HTML); });
@@ -1050,27 +1035,22 @@ void setup() {
              cfg.dataPin = DEFAULT_DATA_PIN; break;
   }
   FastLED.setBrightness(cfg.brightness);
-  // ⚠ MAX_MA IS IN FASTLED'S MODEL UNITS, NOT REAL MILLIAMPS.
+// NO POWER CAP, DELIBERATELY.
   //
-  // FastLED's power model is built for 5050-class WS2812B: about 42 mA per LED
-  // at full white. This panel is WS2812B-**2020** (DESIGN.md:9), a 2 mm part
-  // that draws roughly a third of that -- a 2 mm package cannot dissipate 60 mA.
+  // There was one, at 500 mA, carrying a comment about 32 x 60 mA = 1.9 A. Both
+  // numbers were inherited from somewhere else: 60 mA is the 5050 WS2812B
+  // figure and this panel is WS2812B-2020 (DESIGN.md:9), and Ian's recollection
+  // is that the 500 came from the DEV BOARD, where the LEDs ran off 3.3 V -- a
+  // REGULATOR budget, not a USB one. Two unrelated limits conflated into a
+  // ceiling that then throttled white content to brightness 93/255.
   //
-  // The old comment here claimed 32 x 60 mA = 1.9 A and set the ceiling to 500,
-  // which FastLED then honoured by scaling white content down to brightness
-  // 93/255. The display was being throttled to about a third for a part it does
-  // not have.
+  // MEASURED 2026-09-21: every LED full white at brightness 255 with the
+  // limiter lifted. No brownout, boot count unchanged, brownout counter zero.
   //
-  // MEASURED, 2026-09-21: all 32 LEDs, full white, brightness 255, cap lifted
-  // entirely -- the board did not brown out, boot count did not change, and the
-  // brownout counter stayed at zero. Had it truly been pulling the modelled
-  // 1370 mA, a 500 mA USB port would have collapsed. It did not.
-  //
-  // 1200 model-units therefore maps to something under ~450 mA real, which
-  // leaves full brightness available with the safety net still hanging.
-  // ⚠ A build using 5050 parts MUST lower this -- the model would then be right
-  //   and this ceiling would be three times too generous.
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MA);
+  // The safety net is now evidence rather than arithmetic: /api reports reset
+  // reason and a persistent brownout count, and /stress reproduces the worst
+  // case on demand. If the supply ever cannot hold it, the board says so.
+  // ⚠ A build with 5050 parts on a small supply should reinstate a cap.
 
   // Count boots, and the subset that were brownouts. A brownout nobody watched
   // is otherwise indistinguishable from a power-cycle after the fact.
