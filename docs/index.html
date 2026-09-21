@@ -1,0 +1,70 @@
+<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>7segclock — install</title>
+<style>
+:root{--bg:#0d0f13;--fg:#e8eaed;--mut:#8b929c;--line:#252a32;--acc:#00a0ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:16px/1.55 system-ui,-apple-system,sans-serif}
+.w{max-width:34rem;margin:0 auto;padding:3rem 1.2rem 5rem}
+h1{font-size:1.6rem;margin:0 0 .3rem;letter-spacing:-.01em}
+.sub{color:var(--mut);margin:0 0 2.2rem}
+h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.09em;
+   color:var(--mut);margin:2.4rem 0 .7rem;font-weight:600}
+ol{padding-left:1.1rem}li{margin:.4rem 0}
+code{background:#151920;padding:.12rem .38rem;border-radius:.25rem;font-size:.88em}
+a{color:var(--acc)}
+.card{background:#12161c;border:1px solid var(--line);border-radius:.7rem;
+      padding:1.4rem;margin:0 0 1.5rem}
+.warn{border-left:2px solid #d08f3c;padding-left:.9rem;color:var(--mut);font-size:.9rem}
+esp-web-install-button{--esp-tools-button-color:#04121d;
+                       --esp-tools-button-text-color:#04121d}
+</style>
+
+<div class=w>
+<h1>7segclock</h1>
+<p class=sub>An NTP clock on four WS2812 seven-segment digits, driven by an
+ESP32-C3 Super Mini. Flash it from this page — no toolchain, no drivers.</p>
+
+<div class=card>
+  <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+  <p class=warn style="margin-top:1rem">Needs Chrome or Edge on a desktop.
+  Safari and Firefox have no Web Serial, and this will not appear there.</p>
+</div>
+
+<h2>After flashing</h2>
+<ol>
+  <li>The display shows <code>AP</code> and raises a network called
+      <code>mini7seg-clock</code>. Password <code>sevenseg</code>.</li>
+  <li>Join it; the setup page should open by itself. If not, browse to
+      <code>192.168.4.1</code>.</li>
+  <li>Enter your wifi. It restarts, finds the time, and is then at
+      <code>mini7seg.local</code>.</li>
+</ol>
+
+<h2>Wiring</h2>
+<p>Three wires from the C3, all on one edge of the board:</p>
+<ol>
+  <li><code>5V</code> &rarr; panel <code>H1 V</code></li>
+  <li><code>G</code> &rarr; panel <code>H1 G</code></li>
+  <li><code>GPIO4</code> &rarr; panel <code>H1 DI</code></li>
+</ol>
+<p class=warn>GPIO4 is not arbitrary. On the C3, GPIO2, 8 and 9 are strapping
+pins read at reset to pick the boot mode, and a WS2812 data line idles low — a
+strapping pin tied to one can drop the chip into download mode at power-up,
+which looks exactly like a dead board.</p>
+
+<h2>Updating later</h2>
+<p>Once it is on your network you never need this page again: go to
+<code>mini7seg.local/update</code> and upload <code>firmware.bin</code>.</p>
+<p class=warn>That is <code>firmware.bin</code>, not
+<code>firmware.factory.bin</code>. The factory image carries the bootloader and
+partition table for a first flash over USB; sending it as an OTA payload writes
+a bootloader into an app slot.</p>
+
+<p style="margin-top:3rem"><a href="https://github.com/mcyork/7segclock">Source on GitHub</a></p>
+</div>
+
+<script type="module"
+  src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
