@@ -10,6 +10,7 @@
 #include <Arduino.h>
 
 const char SETTINGS_HTML[] PROGMEM = R"HTML(<!doctype html>
+<meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>mini7seg clock</title>
 <style>
@@ -115,7 +116,7 @@ function paint(d){S=d;
   $('btcn').textContent=!d.tick?'':
     [d.btc?('BTC $'+d.btc.toLocaleString()):'BTC not fetched',
      d.tempF?(d.tempF.toFixed(1)+'\u00b0F'+(d.city?' in '+d.city:'')):'temp not fetched'].join('  \u00b7  ');
-  $('stat').textContent=d.time+'  ·  '+d.ip;
+  $('stat').textContent=d.time+'  -  '+d.ip;
   $('fwv').textContent=d.fw;
   // Built once from the value the firmware reports, not hard-coded here: the
   // allow-list lives in settings.h next to the switch that implements it, and
@@ -130,16 +131,16 @@ function paint(d){S=d;
     'exactly like a dead clock.';
   // Colour and speed only do anything in the modes that read them. Saying so
   // beats greying controls out and leaving people guessing why.
-  const hue={0:'<b>Fixed</b> — the colour you pick.',
-             1:'<b>Cycle</b> — hue drifts through the spectrum at the speed set above.',
-             2:'<b>Chrono</b> — hue <i>is</i> the time of day: cold overnight, warm at noon, violet by evening. After a few days you read the hour off the colour before the digits.'}[d.hue];
+  const hue={0:'<b>Fixed</b> - the colour you pick.',
+             1:'<b>Cycle</b> - hue drifts through the spectrum at the speed set above.',
+             2:'<b>Chrono</b> - hue <i>is</i> the time of day: cold overnight, warm at noon, violet by evening. After a few days you read the hour off the colour before the digits.'}[d.hue];
   const spr=d.spread?' Digits are spread '+d.spread+' apart on the wheel, so it reads as a gradient.':'';
   const env=d.env?' Brightness swells gently.':'';
   const sec={0:'',
              1:' Cursor walks the lit segments, tracing the numerals clockwise.',
-             2:' Cursor walks all 28 segments, lit or not — the beat never depends on the time.',
+             2:' Cursor walks all 28 segments, lit or not - the beat never depends on the time.',
              3:' Four cursors, one per digit, each round its own ring; laps every 6 s.',
-             4:' One cursor round the outside of the whole display. Twelve segments, 60/12=5, so it laps once a MINUTE — its position is a real second hand.'}[d.secpath];
+             4:' One cursor round the outside of the whole display. Twelve segments, 60/12=5, so it laps once a MINUTE - its position is a real second hand.'}[d.secpath];
   const tr={0:'',1:' Short fading tail.',2:' Everything passed stays lit, so it reads as a filling dial.'}[d.sectrail];
   $('note').innerHTML=hue+spr+env+sec+tr;
 }
@@ -167,19 +168,19 @@ $('pin').onclick=e=>{const v=e.target.dataset.v;if(v===undefined)return;
     fetch('/reboot',{method:'POST'}).catch(()=>{});
     setTimeout(()=>location.reload(),4000);};
   n.appendChild(b);};
-$('chk').onclick=()=>{const n=$('fwn');n.textContent='Checking…';
+$('chk').onclick=()=>{const n=$('fwn');n.textContent='Checking...';
   fetch('/checkupdate').then(r=>r.json()).then(u=>{
     if(!u.ok){n.textContent='Could not reach GitHub.';return}
     if(!u.newer){n.textContent='Up to date ('+u.current+').';return}
     n.innerHTML='Version <b>'+u.latest+'</b> available. ';
     const b=document.createElement('button');b.textContent='Install now';
     b.style.cssText='width:auto;padding:.4rem .8rem;margin-left:.4rem';
-    b.onclick=()=>{n.textContent='Downloading and installing — about 30 s. '+
+    b.onclick=()=>{n.textContent='Downloading and installing - about 30 s. '+
       'The clock will restart on its own; do not power it off.';
       fetch('/doupdate').catch(()=>{});};
     n.appendChild(b);});};
 fetch('/api').then(r=>r.json()).then(paint);
 setInterval(()=>fetch('/api').then(r=>r.json()).then(d=>{
-  $('stat').textContent=d.time+'  ·  '+d.ip;}),10000);
+  $('stat').textContent=d.time+'  -  '+d.ip;}),10000);
 </script>
 )HTML";

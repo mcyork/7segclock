@@ -203,7 +203,7 @@ bool hasCreds() {
 
 // ---------------------------------------------------------------- portal
 const char PORTAL_HTML[] PROGMEM =
-  "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+  "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
   "<title>mini7seg clock</title>"
   "<style>body{font:16px system-ui;margin:2rem auto;max-width:22rem;padding:0 1rem}"
   "input,button{font:inherit;width:100%;padding:.6rem;margin:.3rem 0;box-sizing:border-box}"
@@ -216,7 +216,7 @@ const char PORTAL_HTML[] PROGMEM =
 void handleRoot() {
   // One route, two pages: the credentials form while the portal is up, the
   // settings page once we are on a real network.
-  server.send_P(200, "text/html", portalUp ? PORTAL_HTML : SETTINGS_HTML);
+  server.send_P(200, "text/html; charset=utf-8", portalUp ? PORTAL_HTML : SETTINGS_HTML);
 }
 
 void sendState() {
@@ -296,7 +296,7 @@ void handleSave() {
 
   if (!ok) { server.send(500, "text/plain", "could not write settings to flash"); return; }
 
-  server.send(200, "text/html", "<meta name=viewport content='width=device-width'>"
+  server.send(200, "text/html; charset=utf-8", "<meta name=viewport content='width=device-width'>"
               "<p style=\"font:16px system-ui\">Saved. Restarting&hellip;</p>");
   delay(600);
   ESP.restart();
@@ -310,6 +310,7 @@ void handleSave() {
 // picker. Different jobs — one is for me mid-iteration, the other is for you
 // standing in front of the clock with a phone.
 const char UPDATE_HTML[] PROGMEM = R"HTML(<!doctype html>
+<meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>update</title>
 <style>body{margin:0;background:#0d0f13;color:#e8eaed;font:15px system-ui}
 .w{max-width:26rem;margin:0 auto;padding:1.5rem 1.1rem}h1{font-size:1.1rem}
@@ -329,7 +330,7 @@ const f=document.getElementById('f'),p=document.getElementById('p'),s=document.g
 f.onsubmit=e=>{e.preventDefault();const x=new XMLHttpRequest(),d=new FormData(f);
  p.hidden=false;
  x.upload.onprogress=v=>{p.value=v.loaded/v.total*100;s.textContent='Uploading '+p.value.toFixed(0)+'%'};
- x.onload=()=>{s.textContent=x.status==200?'Done — restarting. This page will not respond for ~10s.':'Failed: '+x.responseText};
+ x.onload=()=>{s.textContent=x.status==200?'Done - restarting. This page will not respond for ~10s.':'Failed: '+x.responseText};
  x.onerror=()=>{s.textContent='Connection lost during upload.'};
  x.open('POST','/update');x.send(d);};
 </script>)HTML";
@@ -393,7 +394,7 @@ void startWeb() {
     delay(200);
     ESP.restart();
   });
-  server.on("/update", HTTP_GET, [] { server.send_P(200, "text/html", UPDATE_HTML); });
+  server.on("/update", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", UPDATE_HTML); });
   server.on("/checkupdate", [] {
     bool ok = checkUpdate();
     char b[160];
