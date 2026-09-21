@@ -20,6 +20,7 @@
 #include <Preferences.h>
 #include <FastLED.h>
 #include <sys/time.h>
+#include "String7Segment.h"
 
 // Pins offered for the LED data line, per chip.
 //
@@ -63,6 +64,24 @@ static constexpr uint8_t PIN_LIST[] = { PIN_XLIST };
 #undef X
 static constexpr uint8_t PIN_COUNT = sizeof(PIN_LIST);
 
+static constexpr uint8_t MAX_DIGITS       = 8;
+static constexpr uint8_t SEGMENT_COUNT    = 8;
+static constexpr uint8_t MAX_LEDS_PER_SEG = 8;
+static constexpr uint16_t MAX_LEDS        = MAX_DIGITS * SEGMENT_COUNT * MAX_LEDS_PER_SEG;
+// uint16_t, not uint8_t, and the reason is a boundary that bites silently.
+// A uint8_t base addresses 0..254 with 255 spent on the sentinel, so the real
+// ceiling would be 255 LEDs -- while the buffer below is MAX_LEDS (512). A
+// fully-loaded 8 digits x 8 LEDs/segment would have had nowhere to put half its
+// indices. Widening costs 64 bytes of RAM and the same in NVS, and it makes the
+// ~770 bytes of CRGB buffer that were already allocated actually reachable.
+static constexpr uint16_t SEGMENT_ABSENT   = 0xFFFF;
+static constexpr uint16_t SEGMENT_BASE_MAX = MAX_LEDS - 1;
+static constexpr uint8_t SEGMENT_DP_INDEX = 7;
+
+static constexpr uint8_t DEFAULT_DIGITS       = 4;
+static constexpr uint8_t DEFAULT_LEDS_PER_SEG = 1;
+static constexpr uint16_t DEFAULT_DP_MASK     = 0x000F;
+
 enum Hue    : uint8_t { HUE_FIXED = 0, HUE_CYCLE, HUE_CHRONO, HUE_COUNT };
 enum Env    : uint8_t { ENV_NONE  = 0, ENV_BREATHE, ENV_COUNT };
 enum Colon  : uint8_t { COLON_BLINK = 0, COLON_ON, COLON_OFF };
@@ -88,11 +107,180 @@ struct Settings {
   uint8_t cards      = 0x03;   // bitmask: 1 = bitcoin, 2 = temperature
   float   lat        = 0, lon = 0;   // 0,0 = not located yet (and no clocks live there)
   uint8_t dataPin    = DEFAULT_DATA_PIN;   // see PIN_XLIST — changing needs a reboot
+  uint8_t digits      = DEFAULT_DIGITS;
+  uint8_t ledsPerSeg  = DEFAULT_LEDS_PER_SEG;
+  uint16_t dpMask     = DEFAULT_DP_MASK;
+  uint16_t segBase[MAX_DIGITS][SEGMENT_COUNT] = {};
 };
 
+inline uint16_t activeSegmentCount(const Settings& s) {
+  uint16_t n = (uint16_t)s.digits * (SEGMENT_COUNT - 1);
+  for (uint8_t d = 0; d < s.digits && d < MAX_DIGITS; d++)
+    if (s.dpMask & (1U << d)) n++;
+  return n;
+}
+
+inline uint16_t activeLedCount(const Settings& s) {
+  return activeSegmentCount(s) * s.ledsPerSeg;
+}
+
+inline void geometryReset(Settings& s) {
+  uint16_t n = 0;
+  for (uint8_t d = 0; d < MAX_DIGITS; d++) {
+    for (uint8_t seg = 0; seg < SEGMENT_COUNT; seg++) {
+      if (d >= s.digits) {
+        s.segBase[d][seg] = SEGMENT_ABSENT;
+      } else if (seg == SEGMENT_DP_INDEX && !(s.dpMask & (1U << d))) {
+        s.segBase[d][seg] = SEGMENT_ABSENT;
+      } else {
+        s.segBase[d][seg] = (uint16_t)(n++ * s.ledsPerSeg);
+      }
+    }
+  }
+}
+
+inline bool segmentWritable(const Settings& s, uint8_t pos, uint8_t seg) {
+  if (pos >= s.digits || seg >= SEGMENT_COUNT) return false;
+  if (seg == SEGMENT_DP_INDEX && !(s.dpMask & (1U << pos))) return false;
+  return s.segBase[pos][seg] != SEGMENT_ABSENT;
+}
+
+inline bool segmentLedIndex(const Settings& s, uint8_t pos, uint8_t seg,
+                            uint8_t led, uint16_t& out) {
+  if (led >= s.ledsPerSeg || !segmentWritable(s, pos, seg)) return false;
+  uint16_t idx = s.segBase[pos][seg] + led;
+  if (idx >= activeLedCount(s) || idx >= MAX_LEDS) return false;
+  out = idx;
+  return true;
+}
+
+inline bool segmentLit(CRGB* leds, const Settings& s, uint8_t pos, uint8_t seg) {
+  for (uint8_t led = 0; led < s.ledsPerSeg; led++) {
+    uint16_t idx;
+    if (segmentLedIndex(s, pos, seg, led, idx) && leds[idx]) return true;
+  }
+  return false;
+}
+
+inline void clearDisplay(CRGB* leds, const Settings& s) {
+  fill_solid(leds, activeLedCount(s), CRGB::Black);
+}
+
+inline void renderSegments(CRGB* leds, const Settings& s, uint8_t pos,
+                           uint8_t segmentMask, CRGB colour) {
+  if (pos >= s.digits) return;
+  for (uint8_t seg = 0; seg < SEGMENT_COUNT; seg++) {
+    if (!(segmentMask & (1U << seg))) continue;
+    for (uint8_t led = 0; led < s.ledsPerSeg; led++) {
+      uint16_t idx;
+      if (segmentLedIndex(s, pos, seg, led, idx)) leds[idx] = colour;
+    }
+  }
+}
+
+inline void renderChar(CRGB* leds, const Settings& s, uint8_t pos, char c, CRGB colour) {
+  renderSegments(leds, s, pos, String7Segment::getPattern(c), colour);
+}
+
+inline void renderDecimalPoint(CRGB* leds, const Settings& s, uint8_t pos, CRGB colour) {
+  renderSegments(leds, s, pos, SEG_DP, colour);
+}
+
+inline bool geometryProblem(const Settings& s, char* err, size_t errLen) {
+  if (s.digits < 1 || s.digits > MAX_DIGITS) {
+    snprintf(err, errLen, "digits must be 1..%u", MAX_DIGITS);
+    return true;
+  }
+  if (s.ledsPerSeg < 1 || s.ledsPerSeg > MAX_LEDS_PER_SEG) {
+    snprintf(err, errLen, "ledsPerSeg must be 1..%u", MAX_LEDS_PER_SEG);
+    return true;
+  }
+  if (s.dpMask & ~((1U << MAX_DIGITS) - 1U)) {
+    snprintf(err, errLen, "dpMask uses bits above digit %u", (uint8_t)(MAX_DIGITS - 1));
+    return true;
+  }
+  if (activeLedCount(s) > MAX_LEDS) {
+    snprintf(err, errLen, "geometry uses more than MAX_LEDS");
+    return true;
+  }
+
+  bool used[MAX_LEDS] = {};
+  uint16_t live = activeLedCount(s);
+  for (uint8_t d = 0; d < MAX_DIGITS; d++) {
+    for (uint8_t seg = 0; seg < SEGMENT_COUNT; seg++) {
+      uint16_t base = s.segBase[d][seg];
+      if (d >= s.digits) {
+        if (base != SEGMENT_ABSENT) {
+          snprintf(err, errLen, "segBase[%u][%u] must be %u for absent digit", d, seg, SEGMENT_ABSENT);
+          return true;
+        }
+        continue;
+      }
+      if (seg == SEGMENT_DP_INDEX && !(s.dpMask & (1U << d))) {
+        if (base != SEGMENT_ABSENT) {
+          snprintf(err, errLen, "segBase[%u][%u] must be %u when dpMask bit is clear", d, seg, SEGMENT_ABSENT);
+          return true;
+        }
+        continue;
+      }
+      if (base == SEGMENT_ABSENT) continue;
+      uint16_t end = base + s.ledsPerSeg - 1;
+      if (d < s.digits && end >= live) {
+        snprintf(err, errLen, "segBase[%u][%u] run exceeds active LED count %u", d, seg, live);
+        return true;
+      }
+      if (end >= MAX_LEDS) {
+        snprintf(err, errLen, "segBase[%u][%u] run exceeds MAX_LEDS", d, seg);
+        return true;
+      }
+      for (uint16_t i = base; i <= end; i++) {
+        if (used[i]) {
+          snprintf(err, errLen, "segBase[%u][%u] run overlaps LED %u", d, seg, i);
+          return true;
+        }
+        used[i] = true;
+      }
+    }
+  }
+  return false;
+}
+
+inline bool packedGeometryProblem(const Settings& s, char* err, size_t errLen) {
+  uint16_t groups = activeSegmentCount(s);
+  if (!groups) return false;
+  uint32_t lastBase = (uint32_t)(groups - 1) * s.ledsPerSeg;
+  if (lastBase > SEGMENT_BASE_MAX) {
+    snprintf(err, errLen, "packed geometry needs base %lu but segBase can store only 0..%u",
+             (unsigned long)lastBase, SEGMENT_BASE_MAX);
+    return true;
+  }
+  return false;
+}
+
+inline void loadGeometry(Preferences& p, Settings& s) {
+  geometryReset(s);
+  if (!p.isKey("digits") || !p.isKey("lps") || !p.isKey("dpmask") || !p.isKey("segbase")) return;
+  if (p.getBytesLength("segbase") != sizeof(s.segBase)) return;
+
+  Settings g = s;
+  g.digits = p.getUChar("digits", g.digits);
+  g.ledsPerSeg = p.getUChar("lps", g.ledsPerSeg);
+  g.dpMask = p.getUShort("dpmask", g.dpMask);
+  if (p.getBytes("segbase", g.segBase, sizeof(g.segBase)) != sizeof(g.segBase)) return;
+
+  char err[96];
+  if (geometryProblem(g, err, sizeof err)) return;
+  s.digits = g.digits;
+  s.ledsPerSeg = g.ledsPerSeg;
+  s.dpMask = g.dpMask;
+  memcpy(s.segBase, g.segBase, sizeof(s.segBase));
+}
+
 inline void loadSettings(Settings& s) {
+  geometryReset(s);
   Preferences p;
   if (!p.begin("disp", true)) return;
+  loadGeometry(p, s);
 
   // Migration. A device already in service has the old single `mode` key and no
   // axis keys; silently resetting it to defaults would be a rude way to ship an
@@ -153,7 +341,11 @@ inline bool saveSettings(const Settings& s) {
          && p.putUChar("colon", s.colon)
          && p.putUChar("speed", s.speed)
          && p.putUChar("tick",  s.tickMins)
-         && p.putUChar("cards", s.cards);
+         && p.putUChar("cards", s.cards)
+         && p.putUChar("digits", s.digits)
+         && p.putUChar("lps", s.ledsPerSeg)
+         && p.putUShort("dpmask", s.dpMask)
+         && p.putBytes("segbase", s.segBase, sizeof(s.segBase)) == sizeof(s.segBase);
   p.putFloat("lat", s.lat); p.putFloat("lon", s.lon);
   p.putUChar("pin", s.dataPin);
   p.putBool("h12", s.hour12);              // 0 is a legal size for `false`
@@ -238,17 +430,26 @@ inline CRGB colourFor(const Settings& s, uint8_t pos, const struct tm& t, uint32
  * Every path except RING advances one step per second, which is what keeps the
  * beat. RING advances by minute fraction and pulses in place instead.
  */
-inline void applyLane(CRGB* leds, const uint8_t* idx, uint8_t cnt, uint8_t head,
+struct SegmentRef {
+  uint8_t digit;
+  uint8_t seg;
+};
+
+inline void applyLane(CRGB* leds, const SegmentRef* idx, uint8_t cnt, uint8_t head,
                       const Settings& s, uint8_t punch, const CRGB& tint) {
-  auto mark = [&](uint16_t i, uint8_t amt) {
-    if (leds[i]) {
-      leds[i] = blend(leds[i], CRGB::White, amt);
-    } else {
-      // Dark segment gets a dim ghost in the display's own colour. Scaled hard
-      // — a bright ghost turns "12:34" into an unreadable "88:88".
-      CRGB g = tint;
-      g.nscale8_video(scale8(amt, 70));
-      leds[i] = g;
+  auto mark = [&](SegmentRef ref, uint8_t amt) {
+    for (uint8_t led = 0; led < s.ledsPerSeg; led++) {
+      uint16_t i;
+      if (!segmentLedIndex(s, ref.digit, ref.seg, led, i)) continue;
+      if (leds[i]) {
+        leds[i] = blend(leds[i], CRGB::White, amt);
+      } else {
+        // Dark segment gets a dim ghost in the display's own colour. Scaled hard
+        // — a bright ghost turns "12:34" into an unreadable "88:88".
+        CRGB g = tint;
+        g.nscale8_video(scale8(amt, 70));
+        leds[i] = g;
+      }
     }
   };
 
@@ -264,7 +465,7 @@ inline void applyLane(CRGB* leds, const uint8_t* idx, uint8_t cnt, uint8_t head,
 
 inline void applySeconds(CRGB* leds, uint16_t n, float secf, const Settings& s, const CRGB& tint) {
   if (s.secpath == PATH_OFF || n == 0) return;
-  uint8_t nd = n / 8;
+  uint8_t nd = s.digits;
   if (nd == 0) return;
 
   uint16_t sec  = (uint16_t)secf;
@@ -274,42 +475,53 @@ inline void applySeconds(CRGB* leds, uint16_t n, float secf, const Settings& s, 
   // legible right up to the next tick.
   uint8_t punch = 60 + (uint8_t)((1.0f - frac) * 195.0f);
 
-  uint8_t idx[40], cnt = 0;
+  SegmentRef idx[MAX_DIGITS * 7];
+  uint8_t cnt = 0;
+  auto push = [&](uint8_t d, uint8_t seg) {
+    if (cnt < (uint8_t)(sizeof idx / sizeof idx[0]) && segmentWritable(s, d, seg))
+      idx[cnt++] = { d, seg };
+  };
 
   switch (s.secpath) {
     case PATH_TRACE:
-      for (uint16_t i = 0; i < n && cnt < sizeof idx; i++)
-        if ((i % 8) != 7 && leds[i]) idx[cnt++] = (uint8_t)i;
+      for (uint8_t d = 0; d < nd; d++)
+        for (uint8_t seg = 0; seg < SEGMENT_DP_INDEX; seg++)
+          if (segmentLit(leds, s, d, seg)) push(d, seg);
       if (cnt) applyLane(leds, idx, cnt, sec % cnt, s, punch, tint);
       return;
 
     case PATH_GHOST:
-      for (uint16_t i = 0; i < n && cnt < sizeof idx; i++)
-        if ((i % 8) != 7) idx[cnt++] = (uint8_t)i;
+      for (uint8_t d = 0; d < nd; d++)
+        for (uint8_t seg = 0; seg < SEGMENT_DP_INDEX; seg++) push(d, seg);
       if (cnt) applyLane(leds, idx, cnt, sec % cnt, s, punch, tint);
       return;
 
     case PATH_ORBIT:
       // Four independent lanes — the trail applies within each digit's ring.
       for (uint8_t d = 0; d < nd; d++) {
-        uint8_t ring[6];
-        for (uint8_t k = 0; k < 6; k++) ring[k] = d * 8 + k;
-        applyLane(leds, ring, 6, (sec + d) % 6, s, punch, tint);
+        SegmentRef ring[6];
+        uint8_t ringCnt = 0;
+        for (uint8_t seg = 0; seg < 6; seg++)
+          if (segmentWritable(s, d, seg)) ring[ringCnt++] = { d, seg };
+        if (ringCnt) applyLane(leds, ring, ringCnt, (sec + d) % ringCnt, s, punch, tint);
       }
       return;
 
     case PATH_RING: {
-      for (uint8_t d = 0; d < nd; d++)     idx[cnt++] = d * 8 + 0;        // A, L->R
-      idx[cnt++] = (nd - 1) * 8 + 1;                                      // B
-      idx[cnt++] = (nd - 1) * 8 + 2;                                      // C
-      for (int8_t d = nd - 1; d >= 0; d--) idx[cnt++] = d * 8 + 3;        // D, R->L
-      idx[cnt++] = 4;                                                     // E
-      idx[cnt++] = 5;                                                     // F
+      for (uint8_t d = 0; d < nd; d++)     push(d, 0);                   // A, L->R
+      push(nd - 1, 1);                                                   // B
+      push(nd - 1, 2);                                                   // C
+      for (int8_t d = nd - 1; d >= 0; d--) push(d, 3);                   // D, R->L
+      push(0, 4);                                                        // E
+      push(0, 5);                                                        // F
       // Minute-locked, not per-second: with 12 markers at 5 s each the cursor
       // position IS the second hand.
-      applyLane(leds, idx, cnt, (uint8_t)((sec % 60) * cnt / 60), s, punch, tint);
+      if (cnt) applyLane(leds, idx, cnt, (uint8_t)((sec % 60) * cnt / 60), s, punch, tint);
       return;
     }
+
+    default:
+      return;   // Old or corrupt NVS enum values disable the overlay.
   }
 }
 

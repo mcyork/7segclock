@@ -56,19 +56,18 @@
 #include "String7Segment.h"
 #include "settings.h"
 #include "webui.h"
+#include "geometryui.h"
 #include "ticker.h"
 
 // ---------------------------------------------------------------- hardware
 #define DATA_PIN     4            // not 2/8/9 — see strapping note above
-#define DIGITS       4
-#define NUM_LEDS     (DIGITS * 8)
 // Brightness now lives in Settings so the web page can change it; this is only
 // the value a virgin device starts at.
 #define BRIGHTNESS   40           // WS2812 at close range; 40 is already bright
 #define MAX_MA       500          // hard ceiling; see note at setMaxPower below
 
 // ---------------------------------------------------------------- behaviour
-#define FW_VERSION   "1.0.0"
+#define FW_VERSION   "1.1.0"
 // Self-update straight from GitHub Releases. The /latest/download/ path always
 // resolves to the newest release's asset, so the device needs no version file
 // to be maintained alongside the binary — the release IS the manifest.
@@ -97,11 +96,11 @@
 #define PASS_MAX  63
 
 // ---------------------------------------------------------------- globals
-CRGB leds[NUM_LEDS];
-String7Segment display(leds, 0, DIGITS);
+CRGB leds[MAX_LEDS];
 Preferences prefs;
 WebServer server(80);
 DNSServer dns;
+CLEDController* ledController = nullptr;
 
 bool portalUp   = false;
 bool timeValid  = false;
@@ -119,22 +118,161 @@ inline String pinListJson() {
   return out;
 }
 
+String jsonEscape(const String& s) {
+  String out;
+  out.reserve(s.length() + 4);
+  for (uint16_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if ((uint8_t)c < 0x20) out += ' ';
+    else out += c;
+  }
+  return out;
+}
+
+void sendJsonError(uint16_t code, const String& problem) {
+  server.send(code, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(problem) + "\"}");
+}
+
+bool parseLongStrict(const String& raw, long& out) {
+  const char* p = raw.c_str();
+  while (*p == ' ' || *p == '\t') p++;
+  if (!*p) return false;
+  char* end;
+  long v = strtol(p, &end, 10);
+  if (end == p) return false;
+  while (*end == ' ' || *end == '\t') end++;
+  if (*end) return false;
+  out = v;
+  return true;
+}
+
+bool readLongArg(const char* name, long lo, long hi, long& out) {
+  if (!server.hasArg(name)) {
+    sendJsonError(400, String("missing ") + name);
+    return false;
+  }
+  long v;
+  if (!parseLongStrict(server.arg(name), v)) {
+    sendJsonError(400, String(name) + " must be an integer");
+    return false;
+  }
+  if (v < lo || v > hi) {
+    sendJsonError(400, String(name) + " must be " + lo + ".." + hi);
+    return false;
+  }
+  out = v;
+  return true;
+}
+
+bool readOptionalU8(const char* name, uint8_t& out, uint8_t lo, uint8_t hi) {
+  if (!server.hasArg(name)) return true;
+  long v;
+  if (!parseLongStrict(server.arg(name), v)) {
+    sendJsonError(400, String(name) + " must be an integer");
+    return false;
+  }
+  if (v < lo || v > hi) {
+    sendJsonError(400, String(name) + " must be " + lo + ".." + hi);
+    return false;
+  }
+  out = (uint8_t)v;
+  return true;
+}
+
+bool argIsAllowed(const String& name, const char* const* allowed, uint8_t count) {
+  for (uint8_t i = 0; i < count; i++) if (name == allowed[i]) return true;
+  return false;
+}
+
+bool rejectUnexpectedArgs(const char* const* allowed, uint8_t count) {
+  for (uint8_t i = 0; i < server.args(); i++) {
+    String name = server.argName(i);
+    if (!argIsAllowed(name, allowed, count)) {
+      sendJsonError(400, "unexpected argument " + name);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool rejectNoArgs() {
+  return rejectUnexpectedArgs(nullptr, 0);
+}
+
 Ticker btc;
 String geoCity;
 uint32_t lastTickMs = 0;
 bool webUp = false;
 
+enum PreviewMode : uint8_t { PREVIEW_OFF = 0, PREVIEW_IDENTIFY, PREVIEW_PROBE };
+PreviewMode previewMode = PREVIEW_OFF;
+uint8_t previewDigit = 0, previewSegment = 0, previewGroup = 0;
+uint32_t previewUntilMs = 0;
+
 // ---------------------------------------------------------------- display
+void renderDigit(uint8_t pos, uint8_t segmentMask, CRGB colour) {
+  renderSegments(leds, cfg, pos, segmentMask, colour);
+}
+
+void showSegment(uint8_t pos, uint8_t seg, CRGB colour) {
+  renderDigit(pos, (uint8_t)(1U << seg), colour);
+}
+
+void setActiveLedCount(uint16_t oldCount = 0) {
+  if (!ledController) return;
+  uint16_t nextCount = activeLedCount(cfg);
+  uint16_t clearCount = max(oldCount, nextCount);
+  fill_solid(leds, clearCount, CRGB::Black);
+  ledController->setLeds(leds, clearCount);
+  FastLED.show();
+  ledController->setLeds(leds, nextCount);
+}
+
+void cancelPreview() {
+  previewMode = PREVIEW_OFF;
+  previewUntilMs = 0;
+}
+
+bool serviceWiringPreview() {
+  if (previewMode == PREVIEW_OFF) return false;
+  if (previewMode == PREVIEW_IDENTIFY && millis() - previewUntilMs < 0x80000000UL) {
+    cancelPreview();
+    return false;
+  }
+
+  clearDisplay(leds, cfg);
+  if (previewMode == PREVIEW_IDENTIFY) {
+    showSegment(previewDigit, previewSegment, CRGB::White);
+  } else if (previewMode == PREVIEW_PROBE) {
+    uint16_t base = (uint16_t)previewGroup * cfg.ledsPerSeg;
+    for (uint8_t led = 0; led < cfg.ledsPerSeg; led++) {
+      uint16_t idx = base + led;
+      if (idx < activeLedCount(cfg)) leds[idx] = CRGB::White;
+    }
+  } else {
+    cancelPreview();
+    return false;
+  }
+  FastLED.show();
+  return true;
+}
+
+bool pumpWeb() {
+  server.handleClient();
+  return serviceWiringPreview();
+}
+
 // ⚠ Only these render: 0-9 A-F H J L N O P R U Y - _ and space. Anything else
 // comes back as a blank digit, silently. "Sync" and "boot" were the first draft
 // of this and both had a letter the library cannot draw (S and t), so they
 // showed as holes. Any digit that would blank lights its DP as a tell.
 void showWord(const char* s) {
-  display.clear();
-  for (uint8_t i = 0; i < DIGITS && s[i]; i++) {
-    display.showChar(s[i], i);
+  clearDisplay(leds, cfg);
+  for (uint8_t i = 0; i < cfg.digits && s[i]; i++) {
+    renderChar(leds, cfg, i, s[i], CRGB(cfg.r, cfg.g, cfg.b));
     if (String7Segment::getPattern(s[i]) == 0 && s[i] != ' ')
-      display.setDecimalPoint(i, true);   // "this character does not exist"
+      renderDecimalPoint(leds, cfg, i, CRGB(cfg.r, cfg.g, cfg.b));   // "this character does not exist"
   }
   FastLED.show();
 }
@@ -142,8 +280,10 @@ void showWord(const char* s) {
 // Busy indicator for blocking waits. A static word during a 15 s connect looks
 // like a hung board; a moving one does not. No letters, so no character-set risk.
 void showSpin(uint8_t step) {
-  display.clear();
-  for (uint8_t d = 0; d < DIGITS; d++) display.spinStep((step + d) % 6, d);
+  static const uint8_t SPIN_SEGMENTS[] = { SEG_A, SEG_B, SEG_C, SEG_D, SEG_E, SEG_F };
+  clearDisplay(leds, cfg);
+  for (uint8_t d = 0; d < cfg.digits; d++)
+    renderDigit(d, SPIN_SEGMENTS[(step + d) % 6], CRGB(cfg.r, cfg.g, cfg.b));
   FastLED.show();
 }
 
@@ -158,15 +298,15 @@ void showTime() {
                    (uint8_t)(mm / 10), (uint8_t)(mm % 10) };
   uint32_t ms = millis();
 
-  display.clear();
+  clearDisplay(leds, cfg);
   // Foreground is set per digit rather than once: that is what lets SPECTRUM
   // spread across the display, and the modes that ignore position simply
   // return the same colour four times.
-  for (uint8_t i = 0; i < 4; i++) {
+  uint8_t shown = min<uint8_t>(4, cfg.digits);
+  for (uint8_t i = 0; i < shown; i++) {
     if (i == 0 && cfg.hour12 && hh < 10) continue;   // blank, not zero-padded
     CRGB c = colourFor(cfg, i, t, ms);
-    display.setForeground(S7Color(c.r, c.g, c.b));
-    display.showDigit(d[i], i);
+    renderDigit(i, String7Segment::getPattern((char)('0' + d[i])), c);
   }
 
   // No colon on this panel, so digit 1's decimal point stands in — blinking on
@@ -176,20 +316,20 @@ void showTime() {
           : (t.tm_sec % 2 == 0);
   if (dp) {
     CRGB c = colourFor(cfg, 1, t, ms);
-    display.setForeground(S7Color(c.r, c.g, c.b));
+    renderDecimalPoint(leds, cfg, 1, c);
   }
-  display.setDecimalPoint(1, dp);
 
   // Seconds overlay goes on LAST, straight into the pixel buffer, because it
   // has to know which segments the digits actually lit — that masking is the
   // whole idea. Doing it through the display API would mean re-deriving the
   // patterns the library just finished drawing.
-  applySeconds(leds, NUM_LEDS, secondsNow(t), cfg, colourFor(cfg, 0, t, ms));
+  applySeconds(leds, activeLedCount(cfg), secondsNow(t), cfg, colourFor(cfg, 0, t, ms));
 
   // Offline shows a dot on digit 3 as well: the time is the last known good
   // one and may be drifting. Blanking the display instead would be worse — a
   // clock that goes dark every time the router hiccups is useless.
-  if (WiFi.status() != WL_CONNECTED) display.setDecimalPoint(3, true);
+  if (WiFi.status() != WL_CONNECTED && cfg.digits > 3)
+    renderDecimalPoint(leds, cfg, 3, colourFor(cfg, 3, t, ms));
   FastLED.show();
 }
 
@@ -225,65 +365,260 @@ void sendState() {
   if (timeValid && getLocalTime(&t, 50))
     snprintf(clockStr, sizeof clockStr, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
 
-  char buf[560];
+  char buf[640];
   snprintf(buf, sizeof buf,
     "{\"hue\":%u,\"spread\":%u,\"env\":%u,\"secpath\":%u,\"sectrail\":%u,"
     "\"r\":%u,\"g\":%u,\"b\":%u,\"bri\":%u,"
-    "\"h12\":%s,\"colon\":%u,\"speed\":%u,\"tick\":%u,\"cards\":%u,\"fw\":\"%s\",\"pin\":%u,\"pins\":[%s],\"btc\":%ld,\"tempF\":%.1f,\"city\":\"%s\","
+    "\"h12\":%s,\"colon\":%u,\"speed\":%u,\"tick\":%u,\"cards\":%u,"
+    "\"digits\":%u,\"ledsPerSeg\":%u,\"dpMask\":%u,"
+    "\"fw\":\"%s\",\"pin\":%u,\"pins\":[%s],\"btc\":%ld,\"tempF\":%.1f,\"city\":\"%s\","
     "\"time\":\"%s\",\"ip\":\"%s\"}",
     cfg.hue, cfg.spread, cfg.env, cfg.secpath, cfg.sectrail,
     cfg.r, cfg.g, cfg.b, cfg.brightness,
-    cfg.hour12 ? "true" : "false", cfg.colon, cfg.speed, cfg.tickMins, cfg.cards, FW_VERSION, cfg.dataPin, pinListJson().c_str(), btc.usd, btc.wxOk ? btc.tempF : 0.0f, geoCity.c_str(), clockStr,
+    cfg.hour12 ? "true" : "false", cfg.colon, cfg.speed, cfg.tickMins, cfg.cards,
+    cfg.digits, cfg.ledsPerSeg, cfg.dpMask,
+    FW_VERSION, cfg.dataPin, pinListJson().c_str(), btc.usd, btc.wxOk ? btc.tempF : 0.0f, geoCity.c_str(), clockStr,
     WiFi.localIP().toString().c_str());
   server.send(200, "application/json", buf);
 }
 
-// Every field is clamped to its own range. The page cannot send a bad value,
-// but the page is not the only thing that can reach this endpoint — a stray
-// brightness of 255 with mode SOLID and white set is 1.9 A.
-static uint8_t argU8(const char* k, uint8_t cur, uint8_t lo, uint8_t hi) {
-  if (!server.hasArg(k)) return cur;
-  long v = server.arg(k).toInt();
-  return (uint8_t)constrain(v, (long)lo, (long)hi);
-}
-
 void handleSet() {
-  cfg.hue        = argU8("hue",    cfg.hue,    0, HUE_COUNT - 1);
-  cfg.spread     = argU8("spread", cfg.spread, 0, 64);
-  cfg.env        = argU8("env",    cfg.env,    0, ENV_COUNT - 1);
-  cfg.secpath    = argU8("secpath",  cfg.secpath,  0, PATH_COUNT - 1);
-  cfg.sectrail   = argU8("sectrail", cfg.sectrail, 0, TRAIL_COUNT - 1);
-  cfg.r          = argU8("r",     cfg.r,    0, 255);
-  cfg.g          = argU8("g",     cfg.g,    0, 255);
-  cfg.b          = argU8("b",     cfg.b,    0, 255);
-  cfg.brightness = argU8("bri",   cfg.brightness, 5, 255);
-  cfg.colon      = argU8("colon", cfg.colon, 0, COLON_OFF);
-  cfg.speed      = argU8("speed", cfg.speed, 1, 20);
-  cfg.tickMins   = argU8("tick",  cfg.tickMins, 0, 60);
-  cfg.cards      = argU8("cards", cfg.cards, 0, 3);
+  static const char* const allowed[] = {
+    "hue", "spread", "env", "secpath", "sectrail", "r", "g", "b", "bri",
+    "colon", "speed", "tick", "cards", "pin", "h12"
+  };
+  if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
+
+  if (!readOptionalU8("hue",    cfg.hue,        0, HUE_COUNT - 1)) return;
+  if (!readOptionalU8("spread", cfg.spread,     0, 64)) return;
+  if (!readOptionalU8("env",    cfg.env,        0, ENV_COUNT - 1)) return;
+  if (!readOptionalU8("secpath",  cfg.secpath,  0, PATH_COUNT - 1)) return;
+  if (!readOptionalU8("sectrail", cfg.sectrail, 0, TRAIL_COUNT - 1)) return;
+  if (!readOptionalU8("r",      cfg.r,          0, 255)) return;
+  if (!readOptionalU8("g",      cfg.g,          0, 255)) return;
+  if (!readOptionalU8("b",      cfg.b,          0, 255)) return;
+  if (!readOptionalU8("bri",    cfg.brightness, 5, 255)) return;
+  if (!readOptionalU8("colon",  cfg.colon,      0, COLON_OFF)) return;
+  if (!readOptionalU8("speed",  cfg.speed,      1, 20)) return;
+  if (!readOptionalU8("tick",   cfg.tickMins,   0, 60)) return;
+  if (!readOptionalU8("cards",  cfg.cards,      0, 3)) return;
   // Validated against the allow-list, not just a range: an arbitrary pin would
   // fall through to the default and silently keep using 4, which looks like the
   // setting simply does not work.
   if (server.hasArg("pin")) {
-    uint8_t want = server.arg("pin").toInt();
-    for (uint8_t p : PIN_LIST) if (p == want) { cfg.dataPin = want; break; }
+    long want;
+    if (!parseLongStrict(server.arg("pin"), want)) {
+      sendJsonError(400, "pin must be an integer");
+      return;
+    }
+    bool ok = false;
+    for (uint8_t p : PIN_LIST) if (p == want) { ok = true; break; }
+    if (!ok) { sendJsonError(400, "pin is not in this chip's allow-list"); return; }
+    cfg.dataPin = (uint8_t)want;
   }
-  if (server.hasArg("h12")) cfg.hour12 = server.arg("h12").toInt() != 0;
+  if (server.hasArg("h12")) {
+    long h12;
+    if (!parseLongStrict(server.arg("h12"), h12)) { sendJsonError(400, "h12 must be an integer"); return; }
+    if (h12 < 0 || h12 > 1) { sendJsonError(400, "h12 must be 0..1"); return; }
+    cfg.hour12 = h12 != 0;
+  }
 
   FastLED.setBrightness(cfg.brightness);
   saveSettings(cfg);        // survives a power cut; the clock is a fixture
   sendState();
 }
 
+String geometryJson() {
+  String out;
+  out.reserve(360);
+  out += "{\"digits\":";
+  out += cfg.digits;
+  out += ",\"ledsPerSeg\":";
+  out += cfg.ledsPerSeg;
+  out += ",\"dpMask\":";
+  out += cfg.dpMask;
+  out += ",\"segBase\":[";
+  for (uint8_t d = 0; d < MAX_DIGITS; d++) {
+    if (d) out += ',';
+    out += '[';
+    for (uint8_t seg = 0; seg < SEGMENT_COUNT; seg++) {
+      if (seg) out += ',';
+      out += cfg.segBase[d][seg];
+    }
+    out += ']';
+  }
+  out += "]}";
+  return out;
+}
+
+void sendGeometry() {
+  server.send(200, "application/json", geometryJson());
+}
+
+bool parseSegBase(Settings& next, String& problem) {
+  // Accepts EITHER next.digits*8 values or the full MAX_DIGITS*8, because the
+  // rows past next.digits have exactly one legal value -- SEGMENT_ABSENT -- and
+  // making a client transmit 32 copies of a constant is busywork it can only get
+  // wrong. Short form is filled in here; long form is still validated in full so
+  // an explicit table that disagrees is caught rather than quietly overwritten.
+  const uint8_t wantRows = next.digits;
+  String raw = server.arg("segBase");
+  const char* p = raw.c_str();
+
+  for (uint8_t d = 0; d < MAX_DIGITS; d++)
+    for (uint8_t seg = 0; seg < SEGMENT_COUNT; seg++)
+      next.segBase[d][seg] = SEGMENT_ABSENT;
+
+  uint16_t count = 0;
+  for (uint8_t d = 0; d < MAX_DIGITS; d++) {
+    for (uint8_t seg = 0; seg < SEGMENT_COUNT; seg++) {
+      while (*p == ' ' || *p == '\t') p++;
+      if (!*p) {
+        // Running out exactly at the end of the active rows is the short form.
+        if (count == (uint16_t)wantRows * SEGMENT_COUNT) return true;
+        problem = String("segBase needs ") + (wantRows * SEGMENT_COUNT) + " or " +
+                  (MAX_DIGITS * SEGMENT_COUNT) + " values, got " + count;
+        return false;
+      }
+      if (*p == '-') {
+        problem = String("segBase values must be 0..") + SEGMENT_BASE_MAX + " or " + SEGMENT_ABSENT + " for absent";
+        return false;
+      }
+      char* end;
+      long v = strtol(p, &end, 10);
+      if (end == p) {
+        problem = String("segBase[") + d + "][" + seg + "] must be an integer";
+        return false;
+      }
+      while (*end == ' ' || *end == '\t') end++;
+      if (v == (long)SEGMENT_ABSENT) {
+        next.segBase[d][seg] = SEGMENT_ABSENT;
+      } else if (v > SEGMENT_BASE_MAX) {
+        problem = String("segBase[") + d + "][" + seg + "] must be 0.." + SEGMENT_BASE_MAX + " or " + SEGMENT_ABSENT + " for absent";
+        return false;
+      } else {
+        next.segBase[d][seg] = (uint16_t)v;
+      }
+      count++;
+      p = end;
+      if (*p == ',') p++;
+    }
+  }
+  while (*p == ' ' || *p == '\t' || *p == ',') p++;
+  if (*p) {
+    problem = String("segBase has more than ") + (MAX_DIGITS * SEGMENT_COUNT) + " values";
+    return false;
+  }
+  return true;
+}
+
+bool applyGeometry(const Settings& next) {
+  uint16_t oldCount = activeLedCount(cfg);
+  cfg.digits = next.digits;
+  cfg.ledsPerSeg = next.ledsPerSeg;
+  cfg.dpMask = next.dpMask;
+  memcpy(cfg.segBase, next.segBase, sizeof(cfg.segBase));
+  cancelPreview();
+  setActiveLedCount(oldCount);
+  return saveSettings(cfg);
+}
+
+void handleGeometry() {
+  if (!rejectNoArgs()) return;
+  sendGeometry();
+}
+
+void handleSetGeometry() {
+  static const char* const allowed[] = { "digits", "ledsPerSeg", "dpMask", "segBase", "reset" };
+  if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
+
+  Settings next = cfg;
+  if (server.hasArg("reset")) {
+    long reset;
+    if (!parseLongStrict(server.arg("reset"), reset)) { sendJsonError(400, "reset must be an integer"); return; }
+    if (reset != 1) { sendJsonError(400, "reset must be 1"); return; }
+    if (server.args() != 1) { sendJsonError(400, "reset cannot be combined with other geometry arguments"); return; }
+    next.digits = DEFAULT_DIGITS;
+    next.ledsPerSeg = DEFAULT_LEDS_PER_SEG;
+    next.dpMask = DEFAULT_DP_MASK;
+    geometryReset(next);
+    if (!applyGeometry(next)) { sendJsonError(500, "could not write geometry to flash"); return; }
+    sendGeometry();
+    return;
+  }
+
+  long v;
+  if (!readLongArg("digits", 1, MAX_DIGITS, v)) return;
+  next.digits = (uint8_t)v;
+  if (!readLongArg("ledsPerSeg", 1, MAX_LEDS_PER_SEG, v)) return;
+  next.ledsPerSeg = (uint8_t)v;
+  if (!readLongArg("dpMask", 0, (1U << MAX_DIGITS) - 1U, v)) return;
+  next.dpMask = (uint16_t)v;
+
+  if (server.hasArg("segBase")) {
+    String problem;
+    if (!parseSegBase(next, problem)) { sendJsonError(400, problem); return; }
+  } else {
+    char err[96];
+    if (packedGeometryProblem(next, err, sizeof err)) { sendJsonError(400, err); return; }
+    geometryReset(next);
+  }
+
+  char err[96];
+  if (geometryProblem(next, err, sizeof err)) { sendJsonError(400, err); return; }
+  if (!applyGeometry(next)) { sendJsonError(500, "could not write geometry to flash"); return; }
+  sendGeometry();
+}
+
+void handleIdentify() {
+  static const char* const allowed[] = { "d", "s" };
+  if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
+  long d, seg;
+  if (!readLongArg("d", 0, cfg.digits - 1, d)) return;
+  if (!readLongArg("s", 0, SEGMENT_COUNT - 1, seg)) return;
+  if (!segmentWritable(cfg, (uint8_t)d, (uint8_t)seg)) {
+    sendJsonError(400, String("segment d=") + d + " s=" + seg + " is absent");
+    return;
+  }
+
+  previewMode = PREVIEW_IDENTIFY;
+  previewDigit = (uint8_t)d;
+  previewSegment = (uint8_t)seg;
+  previewUntilMs = millis() + 1500UL;
+  serviceWiringPreview();
+  server.send(200, "application/json", "{\"ok\":true,\"mode\":\"identify\"}");
+}
+
+void handleProbe() {
+  static const char* const allowed[] = { "i" };
+  if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
+  long i;
+  if (!readLongArg("i", -1, (activeLedCount(cfg) / cfg.ledsPerSeg) - 1, i)) return;
+  if (i < 0) {
+    cancelPreview();
+    clearDisplay(leds, cfg);
+    FastLED.show();
+    server.send(200, "application/json", "{\"ok\":true,\"mode\":\"off\"}");
+    return;
+  }
+
+  previewMode = PREVIEW_PROBE;
+  previewGroup = (uint8_t)i;
+  previewUntilMs = 0;
+  serviceWiringPreview();
+  server.send(200, "application/json", "{\"ok\":true,\"mode\":\"probe\"}");
+}
+
 void handleSave() {
+  static const char* const allowed[] = { "ssid", "pass" };
+  if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
   String ssid = server.arg("ssid");
   String pass = server.arg("pass");
   // 802.11 caps these. Over-length stores fine and then never associates, which
   // looks like a wrong password forever.
-  if (ssid.isEmpty() || ssid.length() > SSID_MAX || pass.length() > PASS_MAX) {
-    server.send(400, "text/plain", "ssid 1-32 chars, password up to 63");
-    return;
-  }
+  if (ssid.isEmpty()) { sendJsonError(400, "ssid is required"); return; }
+  if (ssid.length() > SSID_MAX) { sendJsonError(400, "ssid must be 1..32 chars"); return; }
+  if (pass.length() > PASS_MAX) { sendJsonError(400, "pass must be at most 63 chars"); return; }
 
   // Every one of these can fail — NVS full, partition corrupt — and the old
   // code discarded all three return values and told the user "Saved". The
@@ -294,7 +629,7 @@ void handleSave() {
   if (ok) ok = (pass.isEmpty() || prefs.putString("pass", pass) > 0);
   prefs.end();
 
-  if (!ok) { server.send(500, "text/plain", "could not write settings to flash"); return; }
+  if (!ok) { sendJsonError(500, "could not write wifi settings to flash"); return; }
 
   server.send(200, "text/html; charset=utf-8", "<meta name=viewport content='width=device-width'>"
               "<p style=\"font:16px system-ui\">Saved. Restarting&hellip;</p>");
@@ -385,17 +720,28 @@ void startWeb() {
   server.on("/",     handleRoot);
   server.on("/api",  sendState);
   server.on("/set",  handleSet);
+  server.on("/geometry", HTTP_GET, handleGeometry);
+  server.on("/geometry", HTTP_POST, handleGeometry);
+  server.on("/setgeometry", handleSetGeometry);
+  server.on("/identify", handleIdentify);
+  server.on("/probe", handleProbe);
   server.on("/save", HTTP_POST, handleSave);
   // Deliberately POST: a GET /reboot would be followed by any link prefetcher
   // or crawler that ever saw the page, and rebooting the clock by accident is
   // a rotten way to find that out.
   server.on("/reboot", HTTP_POST, [] {
+    if (!rejectNoArgs()) return;
     server.send(200, "application/json", "{\"ok\":true}");
     delay(200);
     ESP.restart();
   });
-  server.on("/update", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", UPDATE_HTML); });
+  server.on("/wiring", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", GEOMETRY_HTML); });
+  server.on("/update", HTTP_GET, [] {
+    if (!rejectNoArgs()) return;
+    server.send_P(200, "text/html; charset=utf-8", UPDATE_HTML);
+  });
   server.on("/checkupdate", [] {
+    if (!rejectNoArgs()) return;
     bool ok = checkUpdate();
     char b[160];
     snprintf(b, sizeof b, "{\"ok\":%s,\"current\":\"%s\",\"latest\":\"%s\",\"newer\":%s}",
@@ -404,6 +750,7 @@ void startWeb() {
     server.send(200, "application/json", b);
   });
   server.on("/doupdate", [] {
+    if (!rejectNoArgs()) return;
     // Reply BEFORE flashing: the download takes ~20 s and the connection would
     // otherwise time out, leaving the page unable to say whether it worked.
     server.send(200, "application/json", "{\"started\":true}");
@@ -549,6 +896,7 @@ void setup() {
   // portal's address is emitted at ~100 ms and lost.
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 2000) delay(10);
+  loadSettings(cfg);                 // defaults until the page has been used
 
   // FastLED takes the pin as a TEMPLATE parameter, not an argument — the
   // clockless driver's bit timing is generated at compile time. So a runtime
@@ -556,23 +904,19 @@ void setup() {
   // and changing the setting needs a reboot. There is no way around it short
   // of hand-rolling the RMT setup.
   switch (cfg.dataPin) {
-#define X(n) case n: FastLED.addLeds<WS2812, n, GRB>(leds, NUM_LEDS); break;
+#define X(n) case n: ledController = &FastLED.addLeds<WS2812, n, GRB>(leds, activeLedCount(cfg)); break;
     PIN_XLIST
 #undef X
     // Unreachable via /set, which validates against PIN_LIST — but NVS can hold
     // a pin from a build for a different chip, so it has to land somewhere.
-    default: FastLED.addLeds<WS2812, DEFAULT_DATA_PIN, GRB>(leds, NUM_LEDS);
+    default: ledController = &FastLED.addLeds<WS2812, DEFAULT_DATA_PIN, GRB>(leds, activeLedCount(cfg));
              cfg.dataPin = DEFAULT_DATA_PIN; break;
   }
-  loadSettings(cfg);                 // defaults until the page has been used
   FastLED.setBrightness(cfg.brightness);
   // BRIGHTNESS is a bare knob. At 40 the worst case is ~180 mA; at 255 a white
   // "88:88" is 32 x 60 mA = 1.9 A through the Super Mini's VBUS trace. This
   // ceiling makes raising it safe.
   FastLED.setMaxPowerInVoltsAndMilliamps(5, MAX_MA);
-  display.setForeground(S7Color(cfg.r, cfg.g, cfg.b));
-  display.setBackground(S7Color(0, 0, 0));
-  display.setBackgroundMode(BG_OVERWRITE);
   showSpin(0);
 
   WiFi.mode(WIFI_STA);
@@ -650,11 +994,11 @@ void loop() {
     lastTickMs = millis();
     struct tm t;
     if (getLocalTime(&t, 50)) {
-      auto pump = [] { server.handleClient(); };
+      auto pump = [] { server.handleClient(); return serviceWiringPreview(); };
       if ((cfg.cards & CARD_BTC) && tickerFetch(btc))
-        tickerScroll(display, leds, NUM_LEDS, btc, cfg, t, pump);
+        tickerScroll(leds, btc, cfg, t, pump);
       if ((cfg.cards & CARD_TEMP) && (cfg.lat || cfg.lon) && tickerWeather(btc, cfg.lat, cfg.lon))
-        tempShow(display, btc, cfg, t, pump);
+        tempShow(leds, btc, cfg, t, pump);
     }
   }
 

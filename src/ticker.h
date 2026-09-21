@@ -20,7 +20,6 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include "String7Segment.h"
 #include "settings.h"
 
 #define TICKER_URL   "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
@@ -99,21 +98,21 @@ inline bool tickerWeather(Ticker& tk, float lat, float lon) {
 
 /** Temperature needs no scroll: "%3dF" is exactly four characters, so -9F
  *  through 999F all fit the panel as-is. Held, not scrolled. */
-inline void tempShow(String7Segment& display, const Ticker& tk, const Settings& s,
-                     const struct tm& t, void (*pump)()) {
+inline void tempShow(CRGB* leds, const Ticker& tk, const Settings& s,
+                     const struct tm& t, bool (*pump)()) {
   if (!tk.wxOk) return;
   char buf[8];
   snprintf(buf, sizeof buf, "%3dF", (int)lroundf(tk.tempF));
-  display.clear();
-  for (uint8_t i = 0; i < 4; i++) {
+  clearDisplay(leds, s);
+  uint8_t w = min<uint8_t>(4, s.digits);
+  for (uint8_t i = 0; i < w; i++) {
     if (buf[i] == ' ') continue;
     CRGB col = colourFor(s, i, t, millis());
-    display.setForeground(S7Color(col.r, col.g, col.b));
-    display.showChar(buf[i], i);
+    renderChar(leds, s, i, buf[i], col);
   }
   FastLED.show();
   uint32_t t0 = millis();
-  while (millis() - t0 < 3500) { if (pump) pump(); delay(5); }
+  while (millis() - t0 < 3500) { if (pump && pump()) return; delay(5); }
 }
 
 inline bool tickerFetch(Ticker& tk) {
@@ -159,9 +158,8 @@ inline bool tickerFetch(Ticker& tk) {
  * server is pumped inside the loop so the page stays responsive, and a clock
  * that pauses for four seconds twice an hour is not a clock anyone notices.
  */
-inline void tickerScroll(String7Segment& display, CRGB* leds, uint16_t n,
-                         const Ticker& tk, const Settings& s,
-                         const struct tm& t, void (*pump)()) {
+inline void tickerScroll(CRGB* leds, const Ticker& tk, const Settings& s,
+                         const struct tm& t, bool (*pump)()) {
   if (!tk.ok) return;
 
   // Thousands separator as the DECIMAL POINT of the digit before it, not as a
@@ -182,22 +180,22 @@ inline void tickerScroll(String7Segment& display, CRGB* leds, uint16_t n,
   msg += "    ";
 
   const uint8_t W = 4;
+  uint8_t shown = min<uint8_t>(W, s.digits);
   for (uint8_t pass = 0; pass < TICKER_PASSES; pass++) {
     for (uint16_t off = 0; off + W <= msg.length(); off++) {
-      display.clear();
-      for (uint8_t i = 0; i < W; i++) {
+      clearDisplay(leds, s);
+      for (uint8_t i = 0; i < shown; i++) {
         uint16_t src = off + i;
         char c = msg[src];
         CRGB col = colourFor(s, i, t, millis());
-        display.setForeground(S7Color(col.r, col.g, col.b));
-        if (c != ' ') display.showChar(c, i);
+        if (c != ' ') renderChar(leds, s, i, c, col);
         // The separator rides on its digit, so it scrolls with the number
         // instead of sitting at a fixed place on the panel.
-        if (dpAfter[src]) display.setDecimalPoint(i, true);
+        if (dpAfter[src]) renderDecimalPoint(leds, s, i, col);
       }
       FastLED.show();
       uint32_t t0 = millis();
-      while (millis() - t0 < TICKER_STEP_MS) { if (pump) pump(); delay(5); }
+      while (millis() - t0 < TICKER_STEP_MS) { if (pump && pump()) return; delay(5); }
     }
   }
 }

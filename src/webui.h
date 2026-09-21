@@ -92,6 +92,7 @@ input[type=color]{width:3.2rem;height:2.1rem;padding:0;border:1px solid var(--li
 </fieldset>
 
 <p class=note id=note></p>
+<p class=note style="border:0"><a href="/wiring" style="color:var(--acc)">Display wiring and shape &rarr;</a></p>
 <p class=note style="border:0"><a href="/update" style="color:var(--acc)">Upload a .bin manually &rarr;</a></p>
 </div>
 <script>
