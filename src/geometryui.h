@@ -75,7 +75,7 @@ svg text{fill:var(--mut);font-size:15px;pointer-events:none}
 const $=i=>document.getElementById(i);
 const AB=65535;   // absent segment; must match SEGMENT_ABSENT in settings.h
 const NM=['A top','B top right','C bottom right','D bottom','E bottom left','F top left','G middle','DP'];
-let G={digits:4,ledsPerSeg:1,dpMask:0,segBase:[]},mode=0,step=0,tbl=null,busy=0;
+let G={digits:4,ledsPerSeg:1,dpMask:0,segBase:[]},mode=0,step=0,tbl=null,busy=0,lastD=0,lastS=0;
 const H=(x,y,w)=>[[x,y+7],[x+7,y],[x+w-7,y],[x+w,y+7],[x+w-7,y+14],[x+7,y+14]].join(' ');
 const V=(x,y,h)=>[[x+7,y],[x+14,y+7],[x+14,y+h-7],[x+7,y+h],[x,y+h-7],[x,y+7]].join(' ');
 const P=[H(6,6,72),V(64,22,49),V(64,89,49),H(6,140,72),V(6,89,49),V(6,22,49),H(6,73,72)];
@@ -105,8 +105,8 @@ function paint(){
   $('nav').style.display=mode==2?'flex':'none';
   $('hint').innerHTML=mode==2?
     '<b>Group '+step+' of '+G.digits*8+'</b> is lit (LED '+step*G.ledsPerSeg+
-    '+). Click the segment that lit up, or Skip if nothing did.':
-   mode==1?'Click any segment and the clock lights it, so you can check the map.':
+    '+). Click the segment that lit up, or Skip if nothing did. Clock is paused.':
+   mode==1?'Click any segment and it stays lit on the display. Clock is paused.':
    'Identify tests the map you have. Learn wiring builds it from nothing.';
 }
 function get(u,ok){
@@ -130,9 +130,11 @@ $('dp').onclick=e=>{if(e.target.dataset.d===undefined)return;
 $('svg').onclick=e=>{
   const id=e.target.id;if(!id||id[0]!='p')return;
   const p=id.substr(1).split('_'),d=+p[0],s=+p[1];
-  if(mode==1){const el=e.target;el.classList.add('hot');
-    setTimeout(()=>el.classList.remove('hot'),1500);
-    get('/identify?d='+d+'&s='+s,()=>{el.classList.remove('hot');say('Digit '+d+', segment '+NM[s]+'.')});
+  if(mode==1){
+    [].forEach.call(document.querySelectorAll('#svg .hot'),x=>x.classList.remove('hot'));
+    e.target.classList.add('hot');
+    lastD=d;lastS=s;
+    get('/identify?d='+d+'&s='+s,()=>say('Digit '+d+', segment '+NM[s]+' -- still lit.'));
     return}
   if(mode!=2)return;
   tbl[d][s]=step*G.ledsPerSeg;step++;advance();
@@ -153,6 +155,10 @@ $('brst').onclick=()=>{let n=0,d,i,a=blank();
   for(d=0;d<G.digits;d++){for(i=0;i<7;i++)a[d][i]=n++*G.ledsPerSeg;
     if(G.dpMask&(1<<d))a[d][7]=n++*G.ledsPerSeg}
   G.segBase=a;mode=0;tbl=null;paint();push()};
+setInterval(()=>{if(!mode)return;
+  if(mode==2)fetch('/probe?i='+step).catch(()=>{});
+  else fetch('/identify?d='+lastD+'&s='+lastS).catch(()=>{});},120000);
+addEventListener('pagehide',()=>{if(mode)fetch('/probe?i=-1',{keepalive:true}).catch(()=>{})});
 load();
 </script>
 )HTML";

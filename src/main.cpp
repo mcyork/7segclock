@@ -208,7 +208,23 @@ bool webUp = false;
 enum PreviewMode : uint8_t { PREVIEW_OFF = 0, PREVIEW_IDENTIFY, PREVIEW_PROBE };
 PreviewMode previewMode = PREVIEW_OFF;
 uint8_t previewDigit = 0, previewSegment = 0, previewGroup = 0;
-uint32_t previewUntilMs = 0;
+uint32_t previewTouchedMs = 0;
+bool     previewDirty     = false;
+
+// A wiring preview LATCHES. The first cut expired after 1500 ms, which made the
+// lit segment a blip you could easily be looking away from -- and you are meant
+// to be looking at the bench, not the screen. It now stays lit until you answer,
+// which is also the only way "click the segment that lit up" is a fair question.
+//
+// ⚠ Latching means something must un-latch it if the tab simply goes away, or a
+// closed browser would leave the clock suspended forever. Five minutes of
+// silence from the page releases the panel back to the clock.
+static constexpr uint32_t PREVIEW_IDLE_MS = 300000UL;
+
+// The one predicate every painter consults. Guarding each call site instead was
+// the original bug: showTime() ran unconditionally at the end of loop() and
+// repainted over the preview five times a second.
+inline bool wiringOwnsPanel() { return previewMode != PREVIEW_OFF; }
 
 // ---------------------------------------------------------------- display
 void renderDigit(uint8_t pos, uint8_t segmentMask, CRGB colour) {
@@ -231,15 +247,19 @@ void setActiveLedCount(uint16_t oldCount = 0) {
 
 void cancelPreview() {
   previewMode = PREVIEW_OFF;
-  previewUntilMs = 0;
+  previewDirty = false;
 }
 
 bool serviceWiringPreview() {
   if (previewMode == PREVIEW_OFF) return false;
-  if (previewMode == PREVIEW_IDENTIFY && millis() - previewUntilMs < 0x80000000UL) {
+  if (millis() - previewTouchedMs > PREVIEW_IDLE_MS) {   // tab went away
     cancelPreview();
     return false;
   }
+  // Latched and unchanged: the panel is already correct, so repainting it at
+  // loop speed would only burn SPI time and risk visible flicker.
+  if (!previewDirty) return true;
+  previewDirty = false;
 
   clearDisplay(leds, cfg);
   if (previewMode == PREVIEW_IDENTIFY) {
@@ -288,6 +308,12 @@ void showSpin(uint8_t step) {
 }
 
 void showTime() {
+  // The single gate. showTime() is reached from three places -- the normal loop,
+  // the wifi-dropped branch, and the post-ticker repaint -- and guarding each of
+  // them was how the preview got painted over in the first place. One refusal
+  // here covers every caller, including any added later.
+  if (wiringOwnsPanel()) return;
+
   struct tm t;
   if (!getLocalTime(&t, 50)) return;
 
@@ -582,9 +608,10 @@ void handleIdentify() {
   }
 
   previewMode = PREVIEW_IDENTIFY;
+  previewDirty = true;
   previewDigit = (uint8_t)d;
   previewSegment = (uint8_t)seg;
-  previewUntilMs = millis() + 1500UL;
+  previewTouchedMs = millis();
   serviceWiringPreview();
   server.send(200, "application/json", "{\"ok\":true,\"mode\":\"identify\"}");
 }
@@ -603,8 +630,9 @@ void handleProbe() {
   }
 
   previewMode = PREVIEW_PROBE;
+  previewDirty = true;
   previewGroup = (uint8_t)i;
-  previewUntilMs = 0;
+  previewTouchedMs = millis();
   serviceWiringPreview();
   server.send(200, "application/json", "{\"ok\":true,\"mode\":\"probe\"}");
 }
@@ -990,7 +1018,11 @@ void loop() {
   // Ticker: fetch on its own cache timer, scroll on the interval you set.
   // Guarded on timeValid so a clock that does not yet know the time never
   // wanders off to fetch a price.
-  if (cfg.tickMins && timeValid && millis() - lastTickMs > cfg.tickMins * 60000UL) {
+  // The ticker paints straight into the buffer on its own path, so the gate in
+  // showTime() does not cover it. A BTC scroll arriving mid-wizard would be a
+  // baffling thing to be asked to identify.
+  if (cfg.tickMins && timeValid && !wiringOwnsPanel() &&
+      millis() - lastTickMs > cfg.tickMins * 60000UL) {
     lastTickMs = millis();
     struct tm t;
     if (getLocalTime(&t, 50)) {
