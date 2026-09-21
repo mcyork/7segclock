@@ -463,6 +463,10 @@ String geometryJson() {
   out += cfg.ledsPerSeg;
   out += ",\"dpMask\":";
   out += cfg.dpMask;
+  out += ",\"stripLen\":";
+  out += cfg.stripLen;
+  out += ",\"ledCount\":";
+  out += activeLedCount(cfg);
   out += ",\"segBase\":[";
   for (uint8_t d = 0; d < MAX_DIGITS; d++) {
     if (d) out += ',';
@@ -543,6 +547,7 @@ bool applyGeometry(const Settings& next) {
   cfg.digits = next.digits;
   cfg.ledsPerSeg = next.ledsPerSeg;
   cfg.dpMask = next.dpMask;
+  cfg.stripLen = next.stripLen;
   memcpy(cfg.segBase, next.segBase, sizeof(cfg.segBase));
   cancelPreview();
   setActiveLedCount(oldCount);
@@ -555,7 +560,7 @@ void handleGeometry() {
 }
 
 void handleSetGeometry() {
-  static const char* const allowed[] = { "digits", "ledsPerSeg", "dpMask", "segBase", "reset" };
+  static const char* const allowed[] = { "digits", "ledsPerSeg", "dpMask", "segBase", "stripLen", "reset" };
   if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
 
   Settings next = cfg;
@@ -567,6 +572,7 @@ void handleSetGeometry() {
     next.digits = DEFAULT_DIGITS;
     next.ledsPerSeg = DEFAULT_LEDS_PER_SEG;
     next.dpMask = DEFAULT_DP_MASK;
+    next.stripLen = 0;
     geometryReset(next);
     if (!applyGeometry(next)) { sendJsonError(500, "could not write geometry to flash"); return; }
     sendGeometry();
@@ -580,6 +586,13 @@ void handleSetGeometry() {
   next.ledsPerSeg = (uint8_t)v;
   if (!readLongArg("dpMask", 0, (1U << MAX_DIGITS) - 1U, v)) return;
   next.dpMask = (uint16_t)v;
+  // 0 is legal and means derive. Anything shorter than the segments need is
+  // clamped up rather than rejected, since it is the segments that are load
+  // bearing -- a too-short strip length would orphan LEDs that are genuinely in use.
+  if (server.hasArg("stripLen")) {
+    if (!readLongArg("stripLen", 0, MAX_LEDS, v)) return;
+    next.stripLen = (uint16_t)v;
+  }
 
   if (server.hasArg("segBase")) {
     String problem;

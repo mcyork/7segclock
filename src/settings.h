@@ -110,6 +110,7 @@ struct Settings {
   uint8_t digits      = DEFAULT_DIGITS;
   uint8_t ledsPerSeg  = DEFAULT_LEDS_PER_SEG;
   uint16_t dpMask     = DEFAULT_DP_MASK;
+  uint16_t stripLen   = 0;     // 0 = derive from the segments; else the real strip length
   uint16_t segBase[MAX_DIGITS][SEGMENT_COUNT] = {};
 };
 
@@ -120,8 +121,18 @@ inline uint16_t activeSegmentCount(const Settings& s) {
   return n;
 }
 
+// The strip can be LONGER than the sum of its segments. A hand-built display
+// often has LEDs that belong to no segment at all -- spares, a run of strip
+// carried between digits, pixels used for something else entirely. Deriving the
+// length from the segments made those LEDs unaddressable, which also meant the
+// Learn wizard could not probe them: it ran out of groups exactly where the
+// segments ended, so a gap was invisible rather than skippable.
+//
+// stripLen 0 means "derive it", which is what an untouched device does.
 inline uint16_t activeLedCount(const Settings& s) {
-  return activeSegmentCount(s) * s.ledsPerSeg;
+  uint16_t derived = activeSegmentCount(s) * s.ledsPerSeg;
+  if (s.stripLen == 0) return derived;
+  return s.stripLen < derived ? derived : s.stripLen;
 }
 
 inline void geometryReset(Settings& s) {
@@ -266,6 +277,7 @@ inline void loadGeometry(Preferences& p, Settings& s) {
   g.digits = p.getUChar("digits", g.digits);
   g.ledsPerSeg = p.getUChar("lps", g.ledsPerSeg);
   g.dpMask = p.getUShort("dpmask", g.dpMask);
+  g.stripLen = p.getUShort("striplen", g.stripLen);   // absent on pre-1.1 devices -> 0 -> derive
   if (p.getBytes("segbase", g.segBase, sizeof(g.segBase)) != sizeof(g.segBase)) return;
 
   char err[96];
@@ -273,6 +285,7 @@ inline void loadGeometry(Preferences& p, Settings& s) {
   s.digits = g.digits;
   s.ledsPerSeg = g.ledsPerSeg;
   s.dpMask = g.dpMask;
+  s.stripLen = g.stripLen;
   memcpy(s.segBase, g.segBase, sizeof(s.segBase));
 }
 
@@ -345,6 +358,7 @@ inline bool saveSettings(const Settings& s) {
          && p.putUChar("digits", s.digits)
          && p.putUChar("lps", s.ledsPerSeg)
          && p.putUShort("dpmask", s.dpMask)
+         && p.putUShort("striplen", s.stripLen)
          && p.putBytes("segbase", s.segBase, sizeof(s.segBase)) == sizeof(s.segBase);
   p.putFloat("lat", s.lat); p.putFloat("lon", s.lon);
   p.putUChar("pin", s.dataPin);

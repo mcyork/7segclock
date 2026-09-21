@@ -53,6 +53,7 @@ svg text{fill:var(--mut);font-size:15px;pointer-events:none}
 <fieldset><legend>Shape</legend>
 <div class=row><label for=nd>Digits</label><input type=range id=nd min=1 max=8><output id=ndv></output></div>
 <div class=row><label for=lp>LEDs per segment</label><input type=range id=lp min=1 max=8><output id=lpv></output></div>
+<div class=row><label for=sl>Total LEDs on strip</label><input type=number id=sl min=0 max=512 style="flex:2;background:#151920;color:var(--fg);border:1px solid var(--line);border-radius:.4rem;padding:.45rem"><output id=slv></output></div>
 <div class=row><label>Decimal points</label><div class=seg id=dp></div></div>
 </fieldset>
 
@@ -62,7 +63,8 @@ svg text{fill:var(--mut);font-size:15px;pointer-events:none}
 <div class=modes id=act style="margin-top:.6rem">
 <button id=bid>Identify</button><button id=blr>Learn wiring</button></div>
 <div class=seg id=nav style="margin-top:.5rem;display:none">
-<button id=bback>Back</button><button id=bskip>Skip</button><button id=bstop>Cancel</button></div>
+<button id=bback>Back</button><button id=bskip>Skip</button>
+<button id=bdone>Finish</button><button id=bstop>Cancel</button></div>
 </fieldset>
 
 <fieldset><legend>Reset</legend>
@@ -82,13 +84,18 @@ const P=[H(6,6,72),V(64,22,49),V(64,89,49),H(6,140,72),V(6,89,49),V(6,22,49),H(6
 const say=t=>$('stat').textContent=t;
 const tab=()=>mode==2?tbl:G.segBase;
 const has=(d,s)=>{const t=tab()[d];return t&&t[s]!=AB?'on':''};
+// Finished means every segment has an LED, not every LED has been offered.
+const need=()=>{let n=G.digits*7,d;for(d=0;d<G.digits;d++)if(G.dpMask&(1<<d))n++;return n};
+const got=()=>{let n=0,d,i,t=tab();for(d=0;d<G.digits;d++)for(i=0;i<8;i++)
+  if(t[d]&&t[d][i]!=null&&t[d][i]!=AB)n++;return n};
+const groups=()=>Math.max(1,Math.floor((G.ledCount||G.digits*8*G.ledsPerSeg)/G.ledsPerSeg));
 function draw(){
   let s='',d,i;
   for(d=0;d<G.digits;d++){
     s+='<g transform="translate('+d*100+',0)">';
     for(i=0;i<7;i++)s+='<polygon class="'+has(d,i)+'" id="p'+d+'_'+i+'" points="'+P[i]+'"/>';
-    if(G.dpMask&(1<<d))s+='<circle class="'+has(d,7)+'" id="p'+d+'_7" cx=90 cy=147 r=7/>';
-    s+='<text x=40 y=172 text-anchor=middle>'+d+'</text></g>';
+    if(G.dpMask&(1<<d))s+='<circle class="'+has(d,7)+'" id="p'+d+'_7" cx=90 cy=147 r="7"/>';
+    s+='<text x=40 y=172 text-anchor=middle>'+(d+1)+'</text></g>';
   }
   $('svg').setAttribute('viewBox','0 0 '+G.digits*100+' 178');
   $('svg').innerHTML=s;
@@ -97,15 +104,18 @@ function paint(){
   draw();
   $('nd').value=G.digits;$('ndv').textContent=G.digits;
   $('lp').value=G.ledsPerSeg;$('lpv').textContent=G.ledsPerSeg;
+  $('sl').value=G.stripLen||0;
+  $('slv').textContent=G.stripLen?G.ledCount+' used':'auto ('+(G.ledCount||0)+')';
   let s='',d;
-  for(d=0;d<G.digits;d++)s+='<button data-d='+d+' aria-pressed='+!!(G.dpMask&(1<<d))+'>'+d+'</button>';
+  for(d=0;d<G.digits;d++)s+='<button data-d='+d+' aria-pressed='+!!(G.dpMask&(1<<d))+'>'+(d+1)+'</button>';
   $('dp').innerHTML=s;
   $('bid').setAttribute('aria-pressed',mode==1);
   $('blr').setAttribute('aria-pressed',mode==2);
   $('nav').style.display=mode==2?'flex':'none';
   $('hint').innerHTML=mode==2?
     '<b>Group '+step+' of '+G.digits*8+'</b> is lit (LED '+step*G.ledsPerSeg+
-    '+). Click the segment that lit up, or Skip if nothing did. Clock is paused.':
+    '+). Click the segment that lit up, or Skip if nothing did. Clock is paused.'+
+    '<br>Mapped <b>'+got()+' of '+need()+'</b> segments.':
    mode==1?'Click any segment and it stays lit on the display. Clock is paused.':
    'Identify tests the map you have. Learn wiring builds it from nothing.';
 }
@@ -117,7 +127,7 @@ function get(u,ok){
 const flat=()=>{let a=[],d,i,t=tab();
   for(d=0;d<G.digits;d++)for(i=0;i<8;i++)a.push(t[d]&&t[d][i]!=null?t[d][i]:AB);
   return a.join(',')};
-const push=()=>get('/setgeometry?digits='+G.digits+'&ledsPerSeg='+G.ledsPerSeg+'&dpMask='+G.dpMask+'&segBase='+flat(),
+const push=()=>get('/setgeometry?digits='+G.digits+'&ledsPerSeg='+G.ledsPerSeg+'&dpMask='+G.dpMask+'&stripLen='+(G.stripLen||0)+'&segBase='+flat(),
   j=>{say(j.ok?'Saved.':'Rejected: '+(j.err||'unknown'));if(!j.ok)load()});
 const load=()=>get('/geometry',j=>{G=j;G.segBase=G.segBase||[];say('Loaded.');paint()});
 const blank=()=>{let a=[],d;for(d=0;d<G.digits;d++)a.push([AB,AB,AB,AB,AB,AB,AB,AB]);return a};
@@ -125,6 +135,8 @@ $('nd').oninput=e=>{G.digits=+e.target.value;
   while(G.segBase.length<G.digits)G.segBase.push([AB,AB,AB,AB,AB,AB,AB,AB]);
   paint();push()};
 $('lp').oninput=e=>{G.ledsPerSeg=+e.target.value;paint();push()};
+$('sl').onchange=e=>{G.stripLen=+e.target.value||0;push()};
+$('bdone').onclick=()=>{if(mode==2)finish(got()>=need())};
 $('dp').onclick=e=>{if(e.target.dataset.d===undefined)return;
   G.dpMask^=1<<+e.target.dataset.d;paint();push()};
 $('svg').onclick=e=>{
@@ -139,8 +151,14 @@ $('svg').onclick=e=>{
   if(mode!=2)return;
   tbl[d][s]=step*G.ledsPerSeg;step++;advance();
 };
+function finish(done){
+  mode=0;G.segBase=tbl;tbl=null;fetch('/probe?i=-1').catch(()=>{});paint();push();
+  say(done?'All '+need()+' segments mapped. Clock resumed.':
+           'Stopped with '+got()+' of '+need()+' mapped. Clock resumed.');
+}
 function advance(){
-  if(step>=G.digits*8){mode=0;G.segBase=tbl;tbl=null;fetch('/probe?i=-1').catch(()=>{});paint();push();return}
+  if(got()>=need()){finish(true);return}          // every segment has an LED
+  if(step>=groups()){finish(false);return}        // ran out of strip
   paint();
   get('/probe?i='+step,j=>{if(j&&j.ok===false)say('Probe refused: '+(j.err||'?'))});
 }
