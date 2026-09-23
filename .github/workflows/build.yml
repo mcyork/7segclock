@@ -1,0 +1,114 @@
+# CI build for 7segclock: compiles the c3supermini firmware on every push to
+# main and every pull request, checks the parts of the OTA contract that the
+# fielded 1.0.0 updater depends on, and keeps both images as a workflow
+# artifact. Publishing a release is deliberately not done here — that is
+# Release.ts, run by hand. No secrets are used.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # No `cache: pip` here: setup-python's pip cache hashes a requirements
+          # file, and this repo has none. actions/cache below covers pip instead.
+          python-version: "3.12"
+
+      - name: Cache pip and PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build
+        run: pio run -e c3supermini
+
+      - name: Check OTA contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=.pio/build/c3supermini/firmware.bin
+          FACTORY=.pio/build/c3supermini/firmware.factory.bin
+          MAX=$((0x1E0000))
+
+          mapfile -t VERS < <(sed -nE 's/^[[:space:]]*#define[[:space:]]+FW_VERSION[[:space:]]+"([^"]*)".*/\1/p' src/main.cpp)
+          if [ "${#VERS[@]}" -ne 1 ] || [ -z "${VERS[0]}" ]; then
+            echo "::error::expected exactly one non-empty '#define FW_VERSION \"X.Y.Z\"' in src/main.cpp, found ${#VERS[@]}"
+            exit 1
+          fi
+          VER="${VERS[0]}"
+
+          for f in "$BIN" "$FACTORY"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f was not produced by the build"
+              exit 1
+            fi
+          done
+
+          SIZE=$(stat -c %s "$BIN")
+          FSIZE=$(stat -c %s "$FACTORY")
+          if [ "$SIZE" -gt "$MAX" ]; then
+            echo "::error::firmware.bin is $SIZE bytes, over the $MAX-byte (0x1E0000) OTA slot"
+            exit 1
+          fi
+
+          MAGIC=$(od -An -tx1 -N1 "$BIN" | tr -d ' \n')
+          if [ "$MAGIC" != "e9" ]; then
+            echo "::error::firmware.bin starts with 0x$MAGIC, not the ESP image magic 0xe9"
+            exit 1
+          fi
+
+          if ! grep -qaF -- "$VER" "$BIN"; then
+            echo "::error::firmware.bin does not contain the FW_VERSION string $VER"
+            exit 1
+          fi
+
+          if ! grep -qaF -- checkupdate "$BIN"; then
+            echo "::error::firmware.bin does not contain the checkupdate route"
+            exit 1
+          fi
+
+          PCT=$(( SIZE * 100 / MAX ))
+          echo "firmware.bin OK: version $VER, $SIZE bytes of $MAX ($PCT%); firmware.factory.bin $FSIZE bytes"
+          {
+            echo "### 7segclock firmware $VER"
+            echo ""
+            echo "| image | bytes |"
+            echo "|---|---|"
+            echo "| firmware.bin (OTA app) | $SIZE ($PCT% of 0x1E0000) |"
+            echo "| firmware.factory.bin | $FSIZE |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: |
+            .pio/build/c3supermini/firmware.bin
+            .pio/build/c3supermini/firmware.factory.bin
+          if-no-files-found: error
