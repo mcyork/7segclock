@@ -81,6 +81,7 @@
 #include "settings.h"
 #include "webui.h"
 #include "geometryui.h"
+#include "roots.h"
 
 // POWER DIAGNOSTICS
 //
@@ -109,7 +110,7 @@ uint8_t  lastStressTry = 0;
 #include "ticker.h"
 
 // ---------------------------------------------------------------- behaviour
-#define FW_VERSION   "1.2.0"
+#define FW_VERSION   "1.2.1"
 // Self-update from GitHub Releases. The device asks the API for the latest tag,
 // and — since 1.2.0 — downloads THAT tag's asset rather than whatever `latest`
 // resolves to at flash time, so the version it verified is the version it flashes.
@@ -604,7 +605,8 @@ void sendState() {
   // Rollback state of the running image and the size of the slot the next update
   // lands in: the two facts a release test has to read off the device itself.
   const esp_partition_t* nextSlot = esp_ota_get_next_update_partition(NULL);
-  o += ",\"otaState\":\"" + String(otaStateName()) + "\",\"otaSlot\":" + String(nextSlot ? nextSlot->size : 0) + "}";
+  o += ",\"otaState\":\"" + String(otaStateName()) + "\",\"otaSlot\":" + String(nextSlot ? nextSlot->size : 0);
+  o += ",\"heap\":" + String(ESP.getFreeHeap()) + "}";   // TLS needs ~40 KB; a bench number worth having
   server.send(200, "application/json", o);
 }
 
@@ -1013,6 +1015,29 @@ bool plainVersion(const String& v) {
   return parts == 3 && digits > 0;
 }
 
+/** Follow redirects by hand with the bundle client, HEAD only, and return the
+ *  first URL we could not (or need not) go past. github.com's 302 to the CDN is
+ *  the case that matters: the CDN host may not verify against the bundle, and
+ *  that is decided by the download attempts, not here. */
+String resolveRedirect(const String& url) {
+  String cur = url;
+  for (uint8_t hop = 0; hop < 4; hop++) {
+    WiFiClientSecure tls;
+    trustRootBundle(tls);
+    HTTPClient http;
+    if (!http.begin(tls, cur)) return cur;
+    http.setConnectTimeout(8000);
+    http.setTimeout(8000);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    int code = http.sendRequest("HEAD");
+    String loc = http.getLocation();
+    http.end();
+    if (code >= 300 && code < 400 && loc.startsWith("https://")) { cur = loc; continue; }
+    return cur;                    // 200, an error, or a relative/odd Location: let the download decide
+  }
+  return cur;
+}
+
 bool checkUpdate() {
   String b = httpGet(GH_LATEST, true, &lastCheckCode);
   int k = b.indexOf("\"tag_name\":\"");
@@ -1152,14 +1177,29 @@ void startWeb() {
     server.client().stop();
     showWord("UPd");
     updErr = "";
-    WiFiClientSecure tls;
-    trustRootBundle(tls);                                           // verified, not setInsecure()
-    String url = String(GH_DL) + latestRawTag + "/firmware.bin";  // the tag we just verified, not "latest"
-    httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GH redirects to its CDN
-    httpUpdate.rebootOnUpdate(true);
-    t_httpUpdate_return r = httpUpdate.update(tls, url);
+    // The asset URL is on github.com, whose chain the IDF bundle verifies, but it
+    // answers with a redirect to GitHub's asset CDN — and THAT host chains to a
+    // root the bundle in this core predates (Let's Encrypt "Root YR", found the
+    // hard way on the first 1.2.0 self-update test). So: resolve the redirect on
+    // the bundle client, then download with the bundle first and, if the CDN's
+    // chain is not in it, with the anchors in roots.h. Never setInsecure().
+    String asset = String(GH_DL) + latestRawTag + "/firmware.bin";  // the tag we just verified, not "latest"
+    String target = resolveRedirect(asset);
+    Serial.printf("[UPD] asset %s\n[UPD] -> %s\n", asset.c_str(), target.c_str());
+    t_httpUpdate_return r = HTTP_UPDATE_FAILED;
+    for (uint8_t attempt = 0; attempt < 2 && r != HTTP_UPDATE_OK; attempt++) {
+      WiFiClientSecure tls;
+      if (attempt == 0) trustRootBundle(tls); else tls.setCACert(EXTRA_ROOTS_PEM);
+      httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+      httpUpdate.rebootOnUpdate(true);
+      r = httpUpdate.update(tls, target);
+      if (r != HTTP_UPDATE_OK) {
+        if (updErr.length()) updErr += "; ";
+        updErr += String(attempt == 0 ? "bundle: " : "roots.h: ") + httpUpdate.getLastError() + " " + httpUpdate.getLastErrorString();
+      }
+    }
     if (r != HTTP_UPDATE_OK) {
-      updErr = String(latestTag) + ": " + httpUpdate.getLastError() + " " + httpUpdate.getLastErrorString();
+      updErr = String(latestTag) + " " + updErr;
       Serial.printf("[UPD] failed %s\n", updErr.c_str());
       holdWord("Err");
     }
