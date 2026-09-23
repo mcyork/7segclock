@@ -43,10 +43,8 @@ ESP32-C3 Super Mini. Flash it from this page — no toolchain, no drivers.</p>
   <li>Enter your wifi. It restarts, finds the time, and is then at
       <code>mini7seg.local</code>.</li>
 </ol>
-<p><b>Timezone:</b> this build shows US Pacific time (America/Los_Angeles, DST
-handled). A timezone setting on the settings page is planned for the next
-firmware; until then, other zones need a rebuild with <code>TZ_STRING</code>
-changed in <code>src/main.cpp</code>.</p>
+<p><b>Timezone:</b> it starts on US Pacific time. Pick your zone under
+<b>Clock</b> on the settings page; daylight saving is handled by the rule.</p>
 <p><b>Trust model:</b> the settings page, firmware upload and update endpoints
 have no password &mdash; anyone on your network can use them. Run it on a
 network you trust.</p>

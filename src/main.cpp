@@ -17,11 +17,11 @@
  * WIRING  (three wires, all on one edge of the C3 Super Mini)
  *   5V   -> panel H1 V
  *   GND  -> panel H1 G
- *   GPIO -> panel H1 DI        see DATA_PIN below
+ *   GPIO -> panel H1 DI        GPIO4 by default; settable on the page
  *
  *   The four digit boards chain H2 (DO) of one into H1 (DI) of the next, so the
  *   panel is one 32-LED strip: digit 0 is LEDs 0-7, digit 3 is LEDs 24-31, each
- *   in segment order A,B,C,D,E,F,G,DP.
+ *   in segment order A,B,C,D,E,F,G,DP. Anything else is learned on /wiring.
  *
  * ⚠ 3.3 V DATA INTO 5 V LEDS IS OUT OF SPEC.
  *   WS2812 wants V_IH = 0.7 x VDD = 3.5 V; a C3 pin gives 3.3 V. It usually
@@ -31,20 +31,30 @@
  *   Schottky in the LED's 5 V feed (drops VDD to ~4.3 V, so V_IH ~3.0 V), a
  *   74AHCT125 buffer, or burn LED 0 as a sacrificial level-shifting pixel.
  *
- * ⚠ DATA_PIN AVOIDS THE STRAPPING PINS. On the C3, GPIO2, GPIO8 and GPIO9 are
+ * ⚠ THE DATA PIN AVOIDS THE STRAPPING PINS. On the C3, GPIO2, GPIO8 and GPIO9 are
  *   sampled at reset to choose the boot mode. A WS2812 line idles low, and a
  *   strapping pin held the wrong way at power-up puts the chip into download
  *   mode instead of running your sketch — which looks exactly like a dead
- *   board. GPIO4 is not strapped and is safe.
+ *   board. The allow-list in settings.h withholds them.
  *
- * THE PORTAL IS NEVER A DEAD END
- *   Earlier revision got this badly wrong: any NTP failure at boot, or ~40 s of
- *   router downtime, parked the clock in the setup portal FOREVER, because
- *   nothing in loop() could ever leave portal mode. A router firmware update
- *   was enough to require physical intervention.
- *   Now: losing wifi never shows the portal quickly, the portal keeps retrying
- *   saved credentials in the background, and NTP failure is not a wifi problem
- *   so it never triggers the portal at all.
+ * THE PORTAL IS NEVER A DEAD END, AND NEVER A REFLEX
+ *   An early revision parked the clock in the setup portal FOREVER on any NTP
+ *   failure or ~40 s of router downtime. A later one still raised the portal on
+ *   a cold boot while the router was booting — which after a power cut is the
+ *   normal case, and it left an open access point up for a minute or two.
+ *   Now: with saved credentials the clock waits before it offers the portal —
+ *   three minutes on a boot that never associated, ten after a drop — keeps
+ *   showing the time while the portal is up, and keeps retrying the saved
+ *   network in the background without blocking the phone.
+ *   NTP failure is not a wifi problem and never triggers the portal at all.
+ *
+ * WRITES NEED POST + A HEADER
+ *   Every route that changes state requires POST and `X-7seg: 1`. A page on
+ *   another origin can make a browser send a GET or a form POST to this LAN
+ *   address, but it cannot add a custom header without a CORS preflight, which
+ *   this server never answers. That closes the <img src=/set?pin=0> hole
+ *   without a password. There is still no authentication: anyone on your LAN
+ *   who opens the page can use it, and the README says so.
  *
  * BUILD  (PlatformIO; every dependency is pinned in platformio.ini)
  *   pio run                                        # build
@@ -64,11 +74,13 @@
 #include <Preferences.h>
 #include <FastLED.h>
 #include <time.h>
+#include <esp_sntp.h>
+#include <esp_ota_ops.h>
+#include <esp_system.h>
 #include "String7Segment.h"
 #include "settings.h"
 #include "webui.h"
 #include "geometryui.h"
-#include <esp_system.h>
 
 // POWER DIAGNOSTICS
 //
@@ -96,37 +108,29 @@ uint32_t bootCount = 0, brownoutCount = 0;
 uint8_t  lastStressTry = 0;
 #include "ticker.h"
 
-// ---------------------------------------------------------------- hardware
-#define DATA_PIN     4            // not 2/8/9 — see strapping note above
-// Brightness now lives in Settings so the web page can change it; this is only
-// the value a virgin device starts at.
-#define BRIGHTNESS   40           // WS2812 at close range; 40 is already bright
-
 // ---------------------------------------------------------------- behaviour
-#define FW_VERSION   "1.1.0"
-// Self-update straight from GitHub Releases. The /latest/download/ path always
-// resolves to the newest release's asset, so the device needs no version file
-// to be maintained alongside the binary — the release IS the manifest.
+#define FW_VERSION   "1.2.0"
+// Self-update from GitHub Releases. The device asks the API for the latest tag,
+// and — since 1.2.0 — downloads THAT tag's asset rather than whatever `latest`
+// resolves to at flash time, so the version it verified is the version it flashes.
 #define GH_REPO      "mcyork/7segclock"
 #define GH_LATEST    "https://api.github.com/repos/" GH_REPO "/releases/latest"
-#define GH_BIN       "https://github.com/" GH_REPO "/releases/latest/download/firmware.bin"
+#define GH_DL        "https://github.com/" GH_REPO "/releases/download/"
 
-#define HOSTNAME     "mini7seg"   // -> http://mini7seg.local/
-#define AP_SSID      "mini7seg-clock"
 #define AP_PASSWORD  "sevenseg"   // >= 8 chars or the AP silently refuses to start
 #define NTP_SERVER   "pool.ntp.org"
 
-// POSIX TZ, not a fixed GMT offset. An offset needs hand-editing twice a year;
-// this string carries the DST rules with it and localtime_r applies them live,
-// so the clock rolls at the right instant with no resync.
-#define TZ_STRING    "PST8PDT,M3.2.0/2,M11.1.0/2"   // America/Los_Angeles
-
-#define WIFI_TIMEOUT_MS      15000UL   // one association attempt
-#define NTP_TIMEOUT_MS       15000UL
+#define WIFI_TIMEOUT_MS      15000UL   // one association attempt at boot
 #define RECONNECT_EVERY_MS   20000UL   // while online-but-dropped
-#define OFFLINE_TO_PORTAL_MS 600000UL  // 10 min down before offering the portal
+#define OFFLINE_TO_PORTAL_MS 600000UL  // 10 min down before offering the portal (after a drop)
+#define BOOT_OFFLINE_MS      180000UL  // 3 min if this boot has never associated: a router takes about that
+                                       // long to come back after a power cut; wrong credentials need the
+                                       // portal sooner than a ten-minute wait, and the portal keeps retrying
 #define PORTAL_RETRY_MS      60000UL   // portal keeps trying saved creds
-#define RESYNC_AFTER_MS      21600000UL // force an NTP resync every 6 h
+#define NTP_RETRY_MS         60000UL   // re-kick SNTP while the first sync is outstanding
+#define RESYNC_AFTER_MS      21600000UL // re-kick SNTP every 6 h
+#define IMAGE_CONFIRM_MS     60000UL   // a fresh OTA image must run this long to stay
+#define FRAME_MS             200       // display cadence; loop() itself runs much faster
 
 #define SSID_MAX  32              // 802.11 limits; longer silently never associates
 #define PASS_MAX  63
@@ -139,12 +143,23 @@ DNSServer dns;
 CLEDController* ledController = nullptr;
 
 bool portalUp   = false;
-bool timeValid  = false;
+volatile bool timeValid = false;  // set by the SNTP callback (tcpip task), never cleared
+bool wasOnline  = false;          // edge detector for onOnline()
+bool everOnline = false;          // this boot associated at least once
+bool bootPending = false;         // image state at boot: pending means the bootloader is tracking us
+bool ntpStarted = false;
 uint32_t lastConnectedMs = 0;
 uint32_t lastReconnectMs = 0;
 uint32_t lastPortalTryMs = 0;
-uint32_t lastSyncMs      = 0;
+uint32_t lastNtpTryMs    = 0;
+uint32_t lastResyncMs    = 0;
+volatile uint32_t lastRealSyncMs = 0;   // stamped ONLY by the SNTP callback (tcpip task)
+uint32_t lastPaintMs     = 0;
+uint8_t  spinStep        = 0;
 Settings cfg;
+uint8_t  bootPin = DEFAULT_DATA_PIN;   // the pin FastLED was built on this boot
+char     hostName[DEV_NAME_MAX + 1];
+char     apSsid[DEV_NAME_MAX + 8];
 
 /** The allow-list as a JSON array, so the settings page renders exactly the
  *  pins this firmware will actually accept. */
@@ -168,6 +183,31 @@ String jsonEscape(const String& s) {
 
 void sendJsonError(uint16_t code, const String& problem) {
   server.send(code, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(problem) + "\"}");
+}
+
+// Is the Host header one of OUR names? DNS rebinding lets a hostile page point its
+// own domain at this LAN address and become same-origin, at which point it can add
+// any header it likes. Writes therefore also have to be addressed to the clock by a
+// name the clock knows it has: its IP, its AP IP, `<name>` or `<name>.local`. Router
+// DNS suffixes (mini7seg.lan) are deliberately NOT accepted — an allowance for
+// "<name>.<anything>" is exactly what an attacker who owns <name>.<tld> would use.
+bool hostIsOurs(String h) {
+  int c = h.indexOf(':'); if (c >= 0) h = h.substring(0, c);   // strip :port
+  h.toLowerCase();
+  if (h.endsWith(".")) h.remove(h.length() - 1);
+  String n = hostName;
+  return h == WiFi.localIP().toString() || h == WiFi.softAPIP().toString() || h == n || h == n + ".local";
+}
+
+// CSRF guard. The pages send POST plus `X-7seg: 1` on every write; nothing a
+// cross-origin page can produce without a preflight carries that header. The Host
+// check closes DNS rebinding. While the portal is up the Host is whatever the phone
+// probed for, and the AP has no internet path, so the Host check is skipped there.
+bool requireWrite() {
+  if (server.method() != HTTP_POST) { sendJsonError(405, "POST required"); return false; }
+  if (server.header("X-7seg") != "1") { sendJsonError(403, "missing X-7seg header"); return false; }
+  if (!portalUp && !hostIsOurs(server.hostHeader())) { sendJsonError(403, "unexpected Host; use the clock's IP or " + String(hostName) + ".local"); return false; }
+  return true;
 }
 
 bool parseLongStrict(const String& raw, long& out) {
@@ -237,13 +277,13 @@ bool rejectNoArgs() {
 }
 
 Ticker btc;
-String geoCity;
 uint32_t lastTickMs = 0;
 bool webUp = false;
 
 enum PreviewMode : uint8_t { PREVIEW_OFF = 0, PREVIEW_IDENTIFY, PREVIEW_PROBE };
 PreviewMode previewMode = PREVIEW_OFF;
-uint8_t previewDigit = 0, previewSegment = 0, previewGroup = 0;
+uint8_t  previewDigit = 0, previewSegment = 0;
+uint16_t previewGroup = 0;        // /probe allows up to 511 groups; a uint8_t truncated them
 uint32_t previewTouchedMs = 0;
 bool     previewDirty     = false;
 
@@ -301,7 +341,7 @@ bool serviceWiringPreview() {
   if (previewMode == PREVIEW_IDENTIFY) {
     showSegment(previewDigit, previewSegment, CRGB::White);
   } else if (previewMode == PREVIEW_PROBE) {
-    uint16_t base = (uint16_t)previewGroup * cfg.ledsPerSeg;
+    uint16_t base = previewGroup * cfg.ledsPerSeg;
     for (uint8_t led = 0; led < cfg.ledsPerSeg; led++) {
       uint16_t idx = base + led;
       if (idx < activeLedCount(cfg)) leds[idx] = CRGB::White;
@@ -314,15 +354,18 @@ bool serviceWiringPreview() {
   return true;
 }
 
+// Service the web server and the wiring preview's idle watchdog. Called from
+// every branch of loop() and from inside the blocking ticker animations, so a
+// closed tab always releases the panel.
 bool pumpWeb() {
   server.handleClient();
   return serviceWiringPreview();
 }
 
 // ⚠ Only these render: 0-9 A-F H J L N O P R U Y - _ and space. Anything else
-// comes back as a blank digit, silently. "Sync" and "boot" were the first draft
-// of this and both had a letter the library cannot draw (S and t), so they
-// showed as holes. Any digit that would blank lights its DP as a tell.
+// comes back as a blank digit, silently. "Sync", "boot" and "oTA" were all early
+// drafts with a letter the library cannot draw (S, t, T), so they showed holes.
+// Any digit that would blank lights its DP as a tell.
 void showWord(const char* s) {
   clearDisplay(leds, cfg);
   for (uint8_t i = 0; i < cfg.digits && s[i]; i++) {
@@ -333,8 +376,8 @@ void showWord(const char* s) {
   FastLED.show();
 }
 
-// Busy indicator for blocking waits. A static word during a 15 s connect looks
-// like a hung board; a moving one does not. No letters, so no character-set risk.
+// Busy indicator for waits. A static word during a 15 s connect looks like a
+// hung board; a moving one does not. No letters, so no character-set risk.
 void showSpin(uint8_t step) {
   static const uint8_t SPIN_SEGMENTS[] = { SEG_A, SEG_B, SEG_C, SEG_D, SEG_E, SEG_F };
   clearDisplay(leds, cfg);
@@ -344,55 +387,137 @@ void showSpin(uint8_t step) {
 }
 
 void showTime() {
-  // The single gate. showTime() is reached from three places -- the normal loop,
-  // the wifi-dropped branch, and the post-ticker repaint -- and guarding each of
-  // them was how the preview got painted over in the first place. One refusal
-  // here covers every caller, including any added later.
+  // The single gate. showTime() is reached from several places and guarding
+  // each of them was how the preview got painted over in the first place. One
+  // refusal here covers every caller, including any added later.
   if (wiringOwnsPanel()) return;
 
   struct tm t;
   if (!getLocalTime(&t, 50)) return;
 
-  int hh = t.tm_hour, mm = t.tm_min;
+  int hh = t.tm_hour, mm = t.tm_min, ss = t.tm_sec;
   if (cfg.hour12) { hh = hh % 12; if (hh == 0) hh = 12; }
-
-  uint8_t d[4] = { (uint8_t)(hh / 10), (uint8_t)(hh % 10),
-                   (uint8_t)(mm / 10), (uint8_t)(mm % 10) };
   uint32_t ms = millis();
+
+  // The face follows the panel. Six or more digits show HH:MM:SS, four or five
+  // show HH:MM, fewer show the hour. The 1.1.0 face was hard-wired to four, so a
+  // six-digit build learned on /wiring showed two permanently dark digits.
+  char face[9];
+  if (cfg.digits >= 6)      snprintf(face, sizeof face, "%02d%02d%02d", hh, mm, ss);
+  else if (cfg.digits >= 4) snprintf(face, sizeof face, "%02d%02d", hh, mm);
+  else if (cfg.digits >= 2) snprintf(face, sizeof face, "%02d", hh);
+  else                      snprintf(face, sizeof face, "%d", hh % 10);   // one digit: the hour's units
+  uint8_t shown = min<uint8_t>(cfg.digits, (uint8_t)strlen(face));
 
   clearDisplay(leds, cfg);
   // Foreground is set per digit rather than once: that is what lets SPECTRUM
   // spread across the display, and the modes that ignore position simply
-  // return the same colour four times.
-  uint8_t shown = min<uint8_t>(4, cfg.digits);
+  // return the same colour every time.
   for (uint8_t i = 0; i < shown; i++) {
     if (i == 0 && cfg.hour12 && hh < 10) continue;   // blank, not zero-padded
     CRGB c = colourFor(cfg, i, t, ms);
-    renderDigit(i, String7Segment::getPattern((char)('0' + d[i])), c);
+    renderDigit(i, String7Segment::getPattern(face[i]), c);
   }
 
   // No colon on this panel, so digit 1's decimal point stands in — blinking on
-  // the second by default, which also makes "still alive" visible for free.
+  // the second by default, which also makes "still alive" visible for free. A
+  // six-digit face gets the second colon on digit 3.
   bool dp = cfg.colon == COLON_ON  ? true
           : cfg.colon == COLON_OFF ? false
           : (t.tm_sec % 2 == 0);
-  if (dp) {
-    CRGB c = colourFor(cfg, 1, t, ms);
-    renderDecimalPoint(leds, cfg, 1, c);
+  if (dp && shown >= 4) {
+    renderDecimalPoint(leds, cfg, 1, colourFor(cfg, 1, t, ms));
+    if (shown >= 6) renderDecimalPoint(leds, cfg, 3, colourFor(cfg, 3, t, ms));
   }
 
   // Seconds overlay goes on LAST, straight into the pixel buffer, because it
   // has to know which segments the digits actually lit — that masking is the
   // whole idea. Doing it through the display API would mean re-deriving the
   // patterns the library just finished drawing.
-  applySeconds(leds, activeLedCount(cfg), secondsNow(t), cfg, colourFor(cfg, 0, t, ms));
+  applySeconds(leds, activeLedCount(cfg), secondsNow(t), cfg, colourFor(cfg, 0, t, ms), shown);
 
-  // Offline shows a dot on digit 3 as well: the time is the last known good
-  // one and may be drifting. Blanking the display instead would be worse — a
-  // clock that goes dark every time the router hiccups is useless.
-  if (WiFi.status() != WL_CONNECTED && cfg.digits > 3)
-    renderDecimalPoint(leds, cfg, 3, colourFor(cfg, 3, t, ms));
+  // Offline lights the LAST lit digit's dot as well: the time is the last known
+  // good one and may be drifting. Blanking the display instead would be worse —
+  // a clock that goes dark every time the router hiccups is useless.
+  if (WiFi.status() != WL_CONNECTED && shown > 0)
+    renderDecimalPoint(leds, cfg, shown - 1, colourFor(cfg, shown - 1, t, ms));
   FastLED.show();
+}
+
+// A word that must be SEEN — "Err" after a failed update — would otherwise be
+// repainted over by the next frame 200 ms later. Hold the frame painter off.
+uint32_t holdUntilMs = 0;
+void holdWord(const char* w) {
+  showWord(w);
+  holdUntilMs = millis() + 3000;
+}
+
+// One frame every FRAME_MS, whatever loop() is doing. Every branch calls this so
+// the display never depends on which state the network machine is in.
+void paintFrame() {
+  uint32_t now = millis();
+  if (now - lastPaintMs < FRAME_MS) return;
+  if (holdUntilMs && (int32_t)(holdUntilMs - now) > 0) return;
+  holdUntilMs = 0;
+  lastPaintMs = now;
+  if (timeValid) showTime();
+  else if (wiringOwnsPanel()) return;
+  else if (portalUp) showWord("AP");   // the one hint to go and find the setup network
+  else { showSpin(spinStep); spinStep = (spinStep + 1) % 6; }
+}
+
+// ---------------------------------------------------------------- OTA rollback
+// The bootloader in this core supports rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE),
+// but initArduino() marks a freshly flashed image valid before setup() even runs,
+// so a build that crashes later would boot-loop with no way back. Returning true
+// here keeps that decision for us: the image is confirmed only after it has run
+// for IMAGE_CONFIRM_MS AND is reachable — on the network, or with its own setup
+// AP up. An image that neither crashes nor can be reached must not be confirmed,
+// because a power cycle would then be the only way back to the one that worked.
+// The router being down is not held against it: the portal counts as reachable.
+extern "C" bool verifyRollbackLater() { return true; }
+
+const char* otaStateName() {
+  esp_ota_img_states_t state;
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) return "unknown";
+  switch (state) {
+    case ESP_OTA_IMG_NEW:            return "new";
+    case ESP_OTA_IMG_PENDING_VERIFY: return "pending";
+    case ESP_OTA_IMG_VALID:          return "valid";
+    case ESP_OTA_IMG_INVALID:        return "invalid";
+    case ESP_OTA_IMG_ABORTED:        return "aborted";
+    default:                         return "undefined";   // factory image, or rollback not tracked
+  }
+}
+
+bool imagePending() {
+  esp_ota_img_states_t state;
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  return running && esp_ota_get_state_partition(running, &state) == ESP_OK && state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+// A restart the user asks for from the page is proof the image is reachable and
+// working — so it confirms the image first. Without this, "Restart now to use
+// GPIO 5" clicked 30 s after an update would roll the firmware back.
+void confirmBeforeRestart() {
+  if (imagePending() && esp_ota_mark_app_valid_cancel_rollback() == ESP_OK)
+    Serial.println("[OTA] image confirmed by a user-requested restart");
+}
+
+void confirmImage() {
+  static bool done = false;
+  if (done || millis() < IMAGE_CONFIRM_MS) return;
+  if (WiFi.status() != WL_CONNECTED && !portalUp) return;   // not reachable yet; keep waiting
+  if (!imagePending()) { done = true; return; }             // factory image, or already confirmed
+  // done only on success: a failed otadata write is retried next pass, not logged as a win
+  esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+  if (err == ESP_OK) {
+    done = true;
+    Serial.println("[OTA] image confirmed: ran 60 s and is reachable; rollback cancelled");
+  } else {
+    Serial.printf("[OTA] confirm failed: %s (will retry)\n", esp_err_to_name(err));
+  }
 }
 
 // ---------------------------------------------------------------- credentials
@@ -404,22 +529,42 @@ bool hasCreds() {
 }
 
 // ---------------------------------------------------------------- portal
-const char PORTAL_HTML[] PROGMEM =
-  "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-  "<title>mini7seg clock</title>"
-  "<style>body{font:16px system-ui;margin:2rem auto;max-width:22rem;padding:0 1rem}"
-  "input,button{font:inherit;width:100%;padding:.6rem;margin:.3rem 0;box-sizing:border-box}"
-  "button{background:#111;color:#fff;border:0;border-radius:.3rem}</style>"
-  "<h2>mini7seg clock</h2><form method=post action=/save>"
-  "<input name=ssid placeholder='WiFi network' maxlength=32 required>"
-  "<input name=pass type=password placeholder='Password' maxlength=63>"
-  "<button>Save and restart</button></form>";
+// The credentials form posts with fetch() so it can carry the X-7seg header —
+// /save is a write like any other. Captive-portal mini-browsers run this fine.
+const char PORTAL_HTML[] PROGMEM = R"HTML(<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>
+<title>mini7seg clock</title>
+<style>body{font:16px system-ui;margin:2rem auto;max-width:22rem;padding:0 1rem}
+input,button{font:inherit;width:100%;padding:.6rem;margin:.3rem 0;box-sizing:border-box}
+button{background:#111;color:#fff;border:0;border-radius:.3rem}#m{color:#b00;font-size:.9rem;min-height:1.2em}</style>
+<h2>%NAME% clock</h2><form id=f>
+<input id=s name=ssid placeholder='WiFi network' maxlength=32 required autocapitalize=off autocorrect=off spellcheck=false>
+<input id=p name=pass type=password placeholder='Password (blank for an open network)' maxlength=63>
+<button>Save and restart</button></form><p id=m></p>
+<script>
+document.getElementById('f').onsubmit=e=>{e.preventDefault();const m=document.getElementById('m');m.textContent='Saving...';
+fetch('/save?'+new URLSearchParams({ssid:document.getElementById('s').value,pass:document.getElementById('p').value}),
+ {method:'POST',headers:{'X-7seg':'1'}}).then(r=>r.json()).then(j=>{m.style.color=j.ok?'#080':'#b00';
+ m.textContent=j.ok?'Saved. Restarting - join your network and open %NAME%.local':('Not saved: '+(j.error||'unknown'))})
+ .catch(()=>{m.textContent='The clock did not answer. Try again.'})};
+</script>)HTML";
 
 void handleRoot() {
   // One route, two pages: the credentials form while the portal is up, the
-  // settings page once we are on a real network.
-  server.send_P(200, "text/html; charset=utf-8", portalUp ? PORTAL_HTML : SETTINGS_HTML);
+  // settings page once we are on a real network. The portal page names the
+  // host the clock will come back under, which is a setting now.
+  if (portalUp) {
+    String page = FPSTR(PORTAL_HTML);
+    page.replace("%NAME%", hostName);
+    server.send(200, "text/html; charset=utf-8", page);
+  } else {
+    server.send_P(200, "text/html; charset=utf-8", SETTINGS_HTML);
+  }
 }
+
+String   latestTag;       // "" until a check has run; normalised (no leading v)
+String   latestRawTag;    // exactly as GitHub spells it, for the download URL
+int      lastCheckCode = 0;
+String   updErr;          // last self-update failure, for the page to show
 
 void sendState() {
   struct tm t;
@@ -427,82 +572,110 @@ void sendState() {
   if (timeValid && getLocalTime(&t, 50))
     snprintf(clockStr, sizeof clockStr, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
 
-  char buf[780];
-  snprintf(buf, sizeof buf,
-    "{\"hue\":%u,\"spread\":%u,\"env\":%u,\"secpath\":%u,\"sectrail\":%u,"
-    "\"r\":%u,\"g\":%u,\"b\":%u,\"bri\":%u,"
-    "\"rst\":\"%s\",\"boots\":%u,\"brownouts\":%u,\"upMin\":%lu,"
-    "\"estMw\":%lu,\"diedAt\":%u,"
-    "\"h12\":%s,\"colon\":%u,\"speed\":%u,\"tick\":%u,\"cards\":%u,"
-    "\"digits\":%u,\"ledsPerSeg\":%u,\"dpMask\":%u,"
-    "\"fw\":\"%s\",\"pin\":%u,\"pins\":[%s],\"btc\":%ld,\"tempF\":%.1f,\"city\":\"%s\","
-    "\"time\":\"%s\",\"ip\":\"%s\"}",
-    cfg.hue, cfg.spread, cfg.env, cfg.secpath, cfg.sectrail,
-    cfg.r, cfg.g, cfg.b, cfg.brightness,
-    resetReasonName(), bootCount, brownoutCount, (unsigned long)(millis() / 60000UL),
-    // What FastLED BELIEVES the panel draws with the current buffer at full
-    // brightness, and the brightness its cap would allow. briCap below
-    // cfg.brightness means the display is being throttled -- and FastLED models
-    // 5050-class parts, so on a 2020 panel that throttle is largely spurious.
-    (unsigned long)calculate_unscaled_power_mW(leds, activeLedCount(cfg)),
-    lastStressTry,
-    cfg.hour12 ? "true" : "false", cfg.colon, cfg.speed, cfg.tickMins, cfg.cards,
-    cfg.digits, cfg.ledsPerSeg, cfg.dpMask,
-    FW_VERSION, cfg.dataPin, pinListJson().c_str(), btc.usd, btc.wxOk ? btc.tempF : 0.0f, geoCity.c_str(), clockStr,
-    WiFi.localIP().toString().c_str());
-  server.send(200, "application/json", buf);
+  // Built as a String, not a fixed snprintf buffer: city and the update error
+  // are external text of unbounded length, and a truncated or unescaped value
+  // used to hand the page invalid JSON, which killed the whole settings page.
+  String o;
+  o.reserve(1000);
+  o += "{\"hue\":" + String(cfg.hue) + ",\"spread\":" + String(cfg.spread) + ",\"env\":" + String(cfg.env);
+  o += ",\"secpath\":" + String(cfg.secpath) + ",\"sectrail\":" + String(cfg.sectrail);
+  o += ",\"r\":" + String(cfg.r) + ",\"g\":" + String(cfg.g) + ",\"b\":" + String(cfg.b) + ",\"bri\":" + String(cfg.brightness);
+  o += ",\"rst\":\"" + String(resetReasonName()) + "\",\"boots\":" + String(bootCount) + ",\"brownouts\":" + String(brownoutCount);
+  o += ",\"upMin\":" + String(millis() / 60000UL);
+  // What FastLED BELIEVES the panel draws with the current buffer at full
+  // brightness. FastLED models 5050-class parts, so on a 2020 panel the number
+  // is generous.
+  o += ",\"estMw\":" + String(calculate_unscaled_power_mW(leds, activeLedCount(cfg)));
+  o += ",\"diedAt\":" + String(lastStressTry);
+  o += ",\"h12\":" + String(cfg.hour12 ? "true" : "false") + ",\"colon\":" + String(cfg.colon) + ",\"speed\":" + String(cfg.speed);
+  o += ",\"tick\":" + String(cfg.tickMins) + ",\"cards\":" + String(cfg.cards);
+  o += ",\"digits\":" + String(cfg.digits) + ",\"ledsPerSeg\":" + String(cfg.ledsPerSeg) + ",\"dpMask\":" + String(cfg.dpMask);
+  o += ",\"fw\":\"" FW_VERSION "\",\"pin\":" + String(cfg.dataPin) + ",\"bootPin\":" + String(bootPin) + ",\"pins\":[" + pinListJson() + "]";
+  o += ",\"name\":\"" + jsonEscape(cfg.name) + "\",\"tz\":\"" + jsonEscape(cfg.tz) + "\"";
+  o += ",\"btc\":" + String(btc.usd);
+  // null, not 0, when there is no reading: 0 F is a real temperature.
+  o += ",\"tempF\":" + (btc.wxOk ? String(btc.tempF, 1) : String("null"));
+  o += ",\"city\":\"" + jsonEscape(cfg.city) + "\"";
+  o += ",\"time\":\"" + String(clockStr) + "\",\"timeValid\":" + String(timeValid ? "true" : "false");
+  o += ",\"syncMin\":" + (lastRealSyncMs ? String((millis() - lastRealSyncMs) / 60000UL) : String("null"));
+  o += ",\"online\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
+  o += ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"host\":\"" + String(hostName) + "\"";
+  o += ",\"updErr\":\"" + jsonEscape(updErr) + "\",\"checkCode\":" + String(lastCheckCode);
+  // Rollback state of the running image and the size of the slot the next update
+  // lands in: the two facts a release test has to read off the device itself.
+  const esp_partition_t* nextSlot = esp_ota_get_next_update_partition(NULL);
+  o += ",\"otaState\":\"" + String(otaStateName()) + "\",\"otaSlot\":" + String(nextSlot ? nextSlot->size : 0) + "}";
+  server.send(200, "application/json", o);
 }
 
 void handleSet() {
+  if (!requireWrite()) return;
   static const char* const allowed[] = {
     "hue", "spread", "env", "secpath", "sectrail", "r", "g", "b", "bri",
-    "colon", "speed", "tick", "cards", "pin", "h12"
+    "colon", "speed", "tick", "cards", "pin", "h12", "tz", "name"
   };
   if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
 
-  if (!readOptionalU8("hue",    cfg.hue,        0, HUE_COUNT - 1)) return;
-  if (!readOptionalU8("spread", cfg.spread,     0, 64)) return;
-  if (!readOptionalU8("env",    cfg.env,        0, ENV_COUNT - 1)) return;
-  if (!readOptionalU8("secpath",  cfg.secpath,  0, PATH_COUNT - 1)) return;
-  if (!readOptionalU8("sectrail", cfg.sectrail, 0, TRAIL_COUNT - 1)) return;
-  if (!readOptionalU8("r",      cfg.r,          0, 255)) return;
-  if (!readOptionalU8("g",      cfg.g,          0, 255)) return;
-  if (!readOptionalU8("b",      cfg.b,          0, 255)) return;
-  if (!readOptionalU8("bri",    cfg.brightness, 5, 255)) return;
-  if (!readOptionalU8("colon",  cfg.colon,      0, COLON_OFF)) return;
-  if (!readOptionalU8("speed",  cfg.speed,      1, 20)) return;
-  if (!readOptionalU8("tick",   cfg.tickMins,   0, 60)) return;
-  if (!readOptionalU8("cards",  cfg.cards,      0, 3)) return;
+  // Validate into a copy, apply only if everything passed. Writing into cfg
+  // field by field meant a request rejected on its third argument had already
+  // changed the first two.
+  Settings next = cfg;
+  if (!readOptionalU8("hue",    next.hue,        0, HUE_COUNT - 1)) return;
+  if (!readOptionalU8("spread", next.spread,     0, 64)) return;
+  if (!readOptionalU8("env",    next.env,        0, ENV_COUNT - 1)) return;
+  if (!readOptionalU8("secpath",  next.secpath,  0, PATH_COUNT - 1)) return;
+  if (!readOptionalU8("sectrail", next.sectrail, 0, TRAIL_COUNT - 1)) return;
+  if (!readOptionalU8("r",      next.r,          0, 255)) return;
+  if (!readOptionalU8("g",      next.g,          0, 255)) return;
+  if (!readOptionalU8("b",      next.b,          0, 255)) return;
+  if (!readOptionalU8("bri",    next.brightness, 5, 255)) return;
+  if (!readOptionalU8("colon",  next.colon,      0, COLON_OFF)) return;
+  if (!readOptionalU8("speed",  next.speed,      1, 20)) return;
+  if (!readOptionalU8("tick",   next.tickMins,   0, 60)) return;
+  if (!readOptionalU8("cards",  next.cards,      0, 3)) return;
   // Validated against the allow-list, not just a range: an arbitrary pin would
   // fall through to the default and silently keep using 4, which looks like the
   // setting simply does not work.
   if (server.hasArg("pin")) {
     long want;
-    if (!parseLongStrict(server.arg("pin"), want)) {
-      sendJsonError(400, "pin must be an integer");
-      return;
-    }
+    if (!parseLongStrict(server.arg("pin"), want)) { sendJsonError(400, "pin must be an integer"); return; }
     bool ok = false;
     for (uint8_t p : PIN_LIST) if (p == want) { ok = true; break; }
     if (!ok) { sendJsonError(400, "pin is not in this chip's allow-list"); return; }
-    cfg.dataPin = (uint8_t)want;
+    next.dataPin = (uint8_t)want;
   }
   if (server.hasArg("h12")) {
     long h12;
     if (!parseLongStrict(server.arg("h12"), h12)) { sendJsonError(400, "h12 must be an integer"); return; }
     if (h12 < 0 || h12 > 1) { sendJsonError(400, "h12 must be 0..1"); return; }
-    cfg.hour12 = h12 != 0;
+    next.hour12 = h12 != 0;
+  }
+  if (server.hasArg("tz")) {
+    String tz = server.arg("tz");
+    if (!validTz(tz.c_str())) { sendJsonError(400, "tz must be a POSIX rule like PST8PDT,M3.2.0/2,M11.1.0/2 (1..47 printable chars, with a digit)"); return; }
+    setField(next.tz, sizeof next.tz, tz);
+  }
+  if (server.hasArg("name")) {
+    String name = server.arg("name");
+    name.toLowerCase();
+    if (!validName(name.c_str())) { sendJsonError(400, "name must be 1..24 of a-z 0-9 - and not start or end with -"); return; }
+    setField(next.name, sizeof next.name, name);
   }
 
+  // Flash first, then RAM: a failed write must change nothing, not "everything
+  // until the next reboot".
+  if (!saveSettings(next)) { sendJsonError(500, "could not write settings to flash; nothing changed"); return; }
+  bool tzChanged = strcmp(next.tz, cfg.tz) != 0;
+  cfg = next;
   FastLED.setBrightness(cfg.brightness);
-  saveSettings(cfg);        // survives a power cut; the clock is a fixture
+  if (tzChanged) { setenv("TZ", cfg.tz, 1); tzset(); }   // live; no resync needed, the rule is applied on read
   sendState();
 }
 
 String geometryJson() {
   String out;
-  out.reserve(360);
-  out += "{\"digits\":";
+  out.reserve(380);
+  out += "{\"ok\":true,\"digits\":";     // ok:true so the page can tell a save from a rejection
   out += cfg.digits;
   out += ",\"ledsPerSeg\":";
   out += cfg.ledsPerSeg;
@@ -605,6 +778,7 @@ void handleGeometry() {
 }
 
 void handleSetGeometry() {
+  if (!requireWrite()) return;
   static const char* const allowed[] = { "digits", "ledsPerSeg", "dpMask", "segBase", "stripLen", "reset" };
   if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
 
@@ -655,6 +829,7 @@ void handleSetGeometry() {
 }
 
 void handleIdentify() {
+  if (!requireWrite()) return;
   static const char* const allowed[] = { "d", "s" };
   if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
   long d, seg;
@@ -675,10 +850,14 @@ void handleIdentify() {
 }
 
 void handleProbe() {
+  if (!requireWrite()) return;
   static const char* const allowed[] = { "i" };
   if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
   long i;
-  if (!readLongArg("i", -1, (activeLedCount(cfg) / cfg.ledsPerSeg) - 1, i)) return;
+  // Round UP: a strip whose length is not a multiple of ledsPerSeg has a partial
+  // last group, and the wizard must be able to light it too.
+  long groups = ((long)activeLedCount(cfg) + cfg.ledsPerSeg - 1) / cfg.ledsPerSeg;
+  if (!readLongArg("i", -1, groups - 1, i)) return;
   if (i < 0) {
     cancelPreview();
     clearDisplay(leds, cfg);
@@ -689,13 +868,14 @@ void handleProbe() {
 
   previewMode = PREVIEW_PROBE;
   previewDirty = true;
-  previewGroup = (uint8_t)i;
+  previewGroup = (uint16_t)i;
   previewTouchedMs = millis();
   serviceWiringPreview();
   server.send(200, "application/json", "{\"ok\":true,\"mode\":\"probe\"}");
 }
 
 void handleSave() {
+  if (!requireWrite()) return;
   static const char* const allowed[] = { "ssid", "pass" };
   if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
   String ssid = server.arg("ssid");
@@ -712,14 +892,20 @@ void handleSave() {
   // that reported success on every pass.
   bool ok = prefs.begin("wifi", false);
   if (ok) ok = prefs.putString("ssid", ssid) > 0;
-  if (ok) ok = (pass.isEmpty() || prefs.putString("pass", pass) > 0);
+  if (ok) {
+    // An empty password means an open network. It used to leave the previous
+    // password in place, so the clock could never join an open network after a
+    // secured one.
+    if (pass.isEmpty()) prefs.remove("pass");
+    else ok = prefs.putString("pass", pass) > 0;
+  }
   prefs.end();
 
   if (!ok) { sendJsonError(500, "could not write wifi settings to flash"); return; }
 
-  server.send(200, "text/html; charset=utf-8", "<meta name=viewport content='width=device-width'>"
-              "<p style=\"font:16px system-ui\">Saved. Restarting&hellip;</p>");
+  server.send(200, "application/json", "{\"ok\":true,\"host\":\"" + String(hostName) + "\"}");
   delay(600);
+  confirmBeforeRestart();
   ESP.restart();
 }
 
@@ -754,26 +940,47 @@ f.onsubmit=e=>{e.preventDefault();const x=new XMLHttpRequest(),d=new FormData(f)
  x.upload.onprogress=v=>{p.value=v.loaded/v.total*100;s.textContent='Uploading '+p.value.toFixed(0)+'%'};
  x.onload=()=>{s.textContent=x.status==200?'Done - restarting. This page will not respond for ~10s.':'Failed: '+x.responseText};
  x.onerror=()=>{s.textContent='Connection lost during upload.'};
- x.open('POST','/update');x.send(d);};
+ x.open('POST','/update');x.setRequestHeader('X-7seg','1');x.send(d);};
 </script>)HTML";
 
+bool uploadOk = false;        // set by the END branch; the completion handler trusts only this
+bool uploadRejected = false;  // header missing at START: nothing is written
+
 void handleUpdateUpload() {
+  // WebServer also routes a NON-multipart POST here (its "raw body" path), and in
+  // that case server.upload() is a null reference — touching it panicked the
+  // clock, so `curl -X POST /update` from any LAN host, or a text/plain form on
+  // any web page, was a remote reboot. Refuse before reading anything.
+  if (!server.header("Content-Type").startsWith("multipart/")) { uploadOk = false; uploadRejected = true; return; }
   HTTPUpload& up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
+    uploadOk = false;
+    uploadRejected = server.header("X-7seg") != "1" || (!portalUp && !hostIsOurs(server.hostHeader()));
+    if (uploadRejected) { Serial.println("[UPD] upload refused: header or Host"); return; }
     Serial.printf("[UPD] %s\n", up.filename.c_str());
-    showWord("oTA");
+    showWord("UPd");
+    // Someone uploading from the page has reached it: confirm a pending image
+    // first, or Update.begin() refuses with ESP_ERR_OTA_ROLLBACK_INVALID_STATE.
+    confirmBeforeRestart();
     // UPDATE_SIZE_UNKNOWN: the browser does not tell us the length up front, so
     // let the Update library size it against the free OTA partition.
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
   } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (uploadRejected) return;
     if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
   } else if (up.status == UPLOAD_FILE_END) {
-    if (Update.end(true)) { Serial.printf("[UPD] ok, %u bytes\n", up.totalSize); showWord("donE"); }
-    else { Update.printError(Serial); showWord("Err"); }
+    if (uploadRejected) return;
+    uploadOk = Update.end(true);
+    if (uploadOk) { Serial.printf("[UPD] ok, %u bytes\n", (unsigned)up.totalSize); showWord("donE"); }
+    else { Update.printError(Serial); holdWord("Err"); }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    // A dropped connection otherwise left Update "already running" until the
+    // next reboot, and every later upload failed at begin().
+    Update.abort();
+    holdWord("Err");
+    Serial.println("[UPD] upload aborted");
   }
 }
-
-String latestTag;          // "" until a check has run
 
 /** Compare dotted versions numerically. "1.10.0" is NEWER than "1.9.0", which a
  *  string compare gets exactly backwards — the usual way this goes wrong. */
@@ -790,52 +997,97 @@ inline bool isNewer(const String& a, const String& b) {
 
 /** Ask GitHub for the newest release tag. Keyless: public repos allow 60
  *  unauthenticated calls an hour per IP, and this runs only when someone presses
- *  Check for updates — there is no automatic check. */
+ *  Check for updates — there is no automatic check. The HTTP status is kept so the
+ *  page can say "no release yet" (404) or "rate limited" (403) instead of a
+ *  blanket "unreachable". */
+/** Exactly N.N.N, digits only. toInt() would accept "1.3.0-test" as 1.3.0 and then
+ *  put the whole tag into a URL; anything that is not a plain version is refused. */
+bool plainVersion(const String& v) {
+  uint8_t parts = 1, digits = 0;
+  for (uint16_t i = 0; i < v.length(); i++) {
+    char c = v[i];
+    if (c >= '0' && c <= '9') { if (++digits > 4) return false; }
+    else if (c == '.' && digits) { if (++parts > 3) return false; digits = 0; }
+    else return false;
+  }
+  return parts == 3 && digits > 0;
+}
+
 bool checkUpdate() {
-  String b = httpGet(GH_LATEST, true);
+  String b = httpGet(GH_LATEST, true, &lastCheckCode);
   int k = b.indexOf("\"tag_name\":\"");
   if (k < 0) return false;
   int e = b.indexOf('"', k + 12);
-  latestTag = b.substring(k + 12, e);
-  if (latestTag.startsWith("v")) latestTag = latestTag.substring(1);
+  if (e < 0) return false;
+  String raw = b.substring(k + 12, e);
+  String tag = raw.startsWith("v") ? raw.substring(1) : raw;
+  if (!plainVersion(tag)) { Serial.printf("[UPD] refusing odd tag %s\n", raw.c_str()); lastCheckCode = 0; return false; }
+  latestRawTag = raw;
+  latestTag = tag;
   Serial.printf("[UPD] running %s, latest %s\n", FW_VERSION, latestTag.c_str());
   return true;
+}
+
+void handleFactoryReset() {
+  if (!requireWrite()) return;
+  if (!rejectNoArgs()) return;
+  // Every namespace this firmware writes. The bootloader and the app slots are
+  // untouched — this is "forget everything", not "unflash".
+  Preferences p;
+  for (const char* ns : { "disp", "wifi", "boots" }) {
+    if (p.begin(ns, false)) { p.clear(); p.end(); }
+  }
+  server.send(200, "application/json", "{\"ok\":true}");
+  delay(400);
+  // ESP-IDF keeps its own copy of the last association in nvs.net80211; without
+  // this the "forgotten" network is still there for the driver to auto-join.
+  WiFi.disconnect(true, true);
+  delay(100);
+  confirmBeforeRestart();
+  ESP.restart();
 }
 
 void startWeb() {
   if (webUp) return;
   webUp = true;
+  static const char* HEADERS[] = { "X-7seg", "Content-Type" };
+  server.collectHeaders(HEADERS, 2);        // or server.header() never sees them
   server.on("/",     handleRoot);
   server.on("/api",  sendState);
-  server.on("/set",  handleSet);
   server.on("/geometry", HTTP_GET, handleGeometry);
-  server.on("/geometry", HTTP_POST, handleGeometry);
-  server.on("/setgeometry", handleSetGeometry);
-  server.on("/identify", handleIdentify);
-  server.on("/probe", handleProbe);
-  server.on("/save", HTTP_POST, handleSave);
-  // Deliberately POST: a GET /reboot would be followed by any link prefetcher
-  // or crawler that ever saw the page, and rebooting the clock by accident is
-  // a rotten way to find that out.
+  // Writes: POST + X-7seg, enforced inside each handler by requireWrite(). The
+  // method is also declared here so a GET falls through to the 404 handler.
+  server.on("/set",         HTTP_POST, handleSet);
+  server.on("/setgeometry", HTTP_POST, handleSetGeometry);
+  server.on("/identify",    HTTP_POST, handleIdentify);
+  server.on("/probe",       HTTP_POST, handleProbe);
+  server.on("/save",        HTTP_POST, handleSave);
+  server.on("/factoryreset", HTTP_POST, handleFactoryReset);
   server.on("/reboot", HTTP_POST, [] {
+    if (!requireWrite()) return;
     if (!rejectNoArgs()) return;
     server.send(200, "application/json", "{\"ok\":true}");
     delay(200);
+    confirmBeforeRestart();
     ESP.restart();
   });
   // Every LED, full white, for a few seconds: the worst case the panel can ever
   // present. Blocking on purpose -- loop() is not running inside a handler, so
   // the clock cannot repaint over it and no preview state machine is needed.
+  // It does NOT pump the web server from inside itself any more: WebServer drops
+  // the current client after 5 s of that and starts handling other requests
+  // re-entrantly, so the hold is capped at 4 s and the loop just waits.
   //
-  // Reports what FastLED BELIEVES it costs and what its cap allowed. If the
-  // board survives this, no display content can brown it out; if it resets, the
-  // brownout counter in /api will say so on the next boot, which is exactly the
-  // evidence a USB power meter would have given.
-  server.on("/stress", [] {
+  // Reports what FastLED BELIEVES it costs. If the board survives this, no
+  // display content can brown it out; if it resets, the brownout counter in
+  // /api will say so on the next boot, which is exactly the evidence a USB power
+  // meter would have given.
+  server.on("/stress", HTTP_POST, [] {
+    if (!requireWrite()) return;
     long ms = 3000;
     if (server.hasArg("ms") && !parseLongStrict(server.arg("ms"), ms)) ms = 3000;
     if (ms < 100) ms = 100;
-    if (ms > 10000) ms = 10000;
+    if (ms > 4000) ms = 4000;
     // No limiter any more, so this is the genuine worst case. It ramps and
     // leaves a breadcrumb in NVS before each step: a step that browns the board
     // out cannot answer, but the next boot can say how far it got.
@@ -845,29 +1097,28 @@ void startWeb() {
     fill_solid(leds, n, CRGB::White);
     uint32_t mw  = calculate_unscaled_power_mW(leds, n);
 
-
     uint8_t reached = 0;
     Preferences sp;
     for (uint8_t step : { (uint8_t)64, (uint8_t)128, (uint8_t)192, (uint8_t)255 }) {
       if (sp.begin("boots", false)) { sp.putUChar("try", step); sp.end(); }
       FastLED.setBrightness(step);
       FastLED.show();
-      uint32_t t1 = millis();
-      while (millis() - t1 < (uint32_t)ms / 4) { server.handleClient(); delay(5); }
+      delay((uint32_t)ms / 4);
       reached = step;
     }
     if (sp.begin("boots", false)) { sp.putUChar("try", 0); sp.end(); }   // survived
+    lastStressTry = 0;
 
     FastLED.setBrightness(savedBri);
     clearDisplay(leds, cfg);
     FastLED.show();
 
-    char b[260];
+    char b[200];
     snprintf(b, sizeof b,
       "{\"ok\":true,\"leds\":%u,\"heldMs\":%ld,"
       "\"modelMw\":%lu,\"modelMa\":%lu,"
       "\"reachedBrightness\":%u,\"survived\":true}",
-      n, ms, (unsigned long)mw, (unsigned long)(mw / 5), reached);
+      (unsigned)n, ms, (unsigned long)mw, (unsigned long)(mw / 5), (unsigned)reached);
     server.send(200, "application/json", b);
   });
   server.on("/wiring", HTTP_GET, [] { server.send_P(200, "text/html; charset=utf-8", GEOMETRY_HTML); });
@@ -875,42 +1126,63 @@ void startWeb() {
     if (!rejectNoArgs()) return;
     server.send_P(200, "text/html; charset=utf-8", UPDATE_HTML);
   });
-  server.on("/checkupdate", [] {
+  // A read that costs a TLS round-trip and one of GitHub's 60 unauthenticated
+  // calls an hour per address — so it is a write for guarding purposes: an <img>
+  // on a stray page could otherwise stall the loop and burn the owner's budget.
+  server.on("/checkupdate", HTTP_POST, [] {
+    if (!requireWrite()) return;
     if (!rejectNoArgs()) return;
     bool ok = checkUpdate();
-    char b[160];
-    snprintf(b, sizeof b, "{\"ok\":%s,\"current\":\"%s\",\"latest\":\"%s\",\"newer\":%s}",
-             ok ? "true" : "false", FW_VERSION, latestTag.c_str(),
-             (ok && isNewer(latestTag, FW_VERSION)) ? "true" : "false");
-    server.send(200, "application/json", b);
+    String o = "{\"ok\":" + String(ok ? "true" : "false") + ",\"code\":" + String(lastCheckCode);
+    o += ",\"current\":\"" FW_VERSION "\",\"latest\":\"" + jsonEscape(latestTag) + "\"";
+    o += ",\"newer\":" + String((ok && isNewer(latestTag, FW_VERSION)) ? "true" : "false") + "}";
+    server.send(200, "application/json", o);
   });
-  server.on("/doupdate", [] {
+  server.on("/doupdate", HTTP_POST, [] {
+    if (!requireWrite()) return;
     if (!rejectNoArgs()) return;
+    // Re-ask GitHub now, and refuse unless the release is strictly newer. A
+    // stale check, or a release that is not newer, must never flash — the 1.1.0
+    // code would have happily downgraded a device to whatever `latest` was.
+    if (!checkUpdate()) { sendJsonError(502, String("GitHub did not answer (HTTP ") + lastCheckCode + ")"); return; }
+    if (!isNewer(latestTag, FW_VERSION)) { sendJsonError(409, "no newer release: latest is " + latestTag + ", running " FW_VERSION); return; }
     // Reply BEFORE flashing: the download takes ~20 s and the connection would
     // otherwise time out, leaving the page unable to say whether it worked.
-    server.send(200, "application/json", "{\"started\":true}");
+    server.send(200, "application/json", "{\"ok\":true,\"started\":true,\"target\":\"" + jsonEscape(latestTag) + "\"}");
     server.client().stop();
-    showWord("oTA");
-    WiFiClientSecure tls; tls.setInsecure();
+    showWord("UPd");
+    updErr = "";
+    WiFiClientSecure tls;
+    trustRootBundle(tls);                                           // verified, not setInsecure()
+    String url = String(GH_DL) + latestRawTag + "/firmware.bin";  // the tag we just verified, not "latest"
     httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GH redirects to its CDN
     httpUpdate.rebootOnUpdate(true);
-    t_httpUpdate_return r = httpUpdate.update(tls, GH_BIN);
-    if (r == HTTP_UPDATE_FAILED) {
-      Serial.printf("[UPD] failed %d: %s\n", httpUpdate.getLastError(),
-                    httpUpdate.getLastErrorString().c_str());
-      showWord("Err");
+    t_httpUpdate_return r = httpUpdate.update(tls, url);
+    if (r != HTTP_UPDATE_OK) {
+      updErr = String(latestTag) + ": " + httpUpdate.getLastError() + " " + httpUpdate.getLastErrorString();
+      Serial.printf("[UPD] failed %s\n", updErr.c_str());
+      holdWord("Err");
     }
   });
   // Two handlers: the second streams the file, the first replies once it is in.
   server.on("/update", HTTP_POST,
     [] {
-      bool ok = !Update.hasError();
+      if (uploadRejected) { sendJsonError(403, "missing X-7seg header"); return; }
+      // Not !Update.hasError(): that is false on a fresh Update object too, so a
+      // POST with no file used to reboot the clock.
+      if (!uploadOk) { server.send(400, "text/plain", "no valid firmware received"); return; }
       server.sendHeader("Connection", "close");
-      server.send(ok ? 200 : 500, "text/plain", ok ? "ok" : "update failed");
-      if (ok) { delay(400); ESP.restart(); }
+      server.send(200, "text/plain", "ok");
+      delay(400);
+      ESP.restart();
     },
     handleUpdateUpload);
-  server.onNotFound(handleRoot);     // also what makes the captive portal work
+  // The captive portal needs every unknown path to land on the form; on the
+  // real network an unknown path is a 404, not the settings page with a 200.
+  server.onNotFound([] {
+    if (portalUp) handleRoot();
+    else server.send(404, "text/plain", "not found");
+  });
   server.begin();
 }
 
@@ -920,27 +1192,120 @@ void startWeb() {
 // ⚠ MDNS.begin() twice without an end() between hangs the mDNS task. It is
 // reachable from three places here (boot, leaving the portal, and the portal's
 // own retry), so the guard is not optional — it froze the clock the first time
-// it came home to a different network.
+// it came home to a different network. ArduinoOTA.begin() used to call
+// MDNS.begin() as well; that is disabled below and its service added here, so
+// there is exactly one owner of the mDNS responder.
 bool mdnsUp = false;
-void startOta() {
-  ArduinoOTA.setHostname(HOSTNAME);
-  ArduinoOTA.onStart([]() { showWord("oTA"); });
-  ArduinoOTA.onEnd([]()   { showWord("donE"); });
-  ArduinoOTA.onError([](ota_error_t) { showWord("Err"); });
-  ArduinoOTA.begin();
-  Serial.printf("[OTA] armed as %s\n", HOSTNAME);
-}
+bool otaUp  = false;
 
 void startMdns() {
   if (mdnsUp) MDNS.end();
   mdnsUp = false;
-  if (MDNS.begin(HOSTNAME)) {
+  if (MDNS.begin(hostName)) {
     MDNS.addService("http", "tcp", 80);
+    MDNS.enableArduino(3232, false);      // what ArduinoOTA.begin() would have advertised
     mdnsUp = true;
-    Serial.printf("[MDNS] http://%s.local/\n", HOSTNAME);
+    Serial.printf("[MDNS] http://%s.local/\n", hostName);
   } else {
     Serial.println("[MDNS] failed");
   }
+}
+
+void startOta() {
+  if (otaUp) return;
+  otaUp = true;
+  ArduinoOTA.setHostname(hostName);
+  ArduinoOTA.setMdnsEnabled(false);       // startMdns() owns the responder
+  ArduinoOTA.onStart([]() { confirmBeforeRestart(); showWord("UPd"); });   // a developer pushing is reachability too
+  ArduinoOTA.onEnd([]()   { showWord("donE"); });
+  ArduinoOTA.onError([](ota_error_t) { holdWord("Err"); });
+  ArduinoOTA.begin();
+  Serial.printf("[OTA] armed as %s\n", hostName);
+}
+
+// ---------------------------------------------------------------- wifi/ntp
+// SNTP calls this when a reply actually lands. It is the ONLY thing that says the
+// time is trustworthy: the old resync path took getLocalTime() succeeding as proof,
+// which it always does once the clock has been set even once, so a network that
+// later blocked NTP drifted for months with "[NTP] ok" in the log.
+void onTimeSynced(struct timeval*) {
+  timeValid = true;
+  lastRealSyncMs = millis();
+  Serial.println("[NTP] synced");
+}
+
+// Kick SNTP. Non-blocking: the callback above flips timeValid when the reply
+// arrives, and loop() keeps serving the web page and OTA meanwhile. The old
+// syncTime() spun for 15 s per call and was called every loop pass while NTP was
+// down, so the device answered HTTP once every 15 s and looked hung.
+void startNtp() {
+  configTzTime(cfg.tz, NTP_SERVER);
+  ntpStarted = true;
+  lastNtpTryMs = millis();
+}
+
+void readCreds(String& ssid, String& pass) {
+  prefs.begin("wifi", true);
+  ssid = prefs.getString("ssid", "");
+  pass = prefs.getString("pass", "");
+  prefs.end();
+}
+
+/** Begin an association with the saved network and return at once. */
+bool beginSta() {
+  String ssid, pass;
+  readCreds(ssid, pass);
+  if (ssid.isEmpty()) return false;
+  Serial.printf("[WIFI] connecting to %s\n", ssid.c_str());
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  return true;
+}
+
+/** Boot-time association: one attempt, blocking with a spinner, so the common
+ *  case (router up) gets the time on the panel as fast as possible. */
+bool tryConnect() {
+  if (!beginSta()) return false;
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS) {
+    paintFrame();
+    delay(20);
+  }
+  if (WiFi.status() != WL_CONNECTED) { Serial.println("[WIFI] not yet"); return false; }
+  Serial.printf("[WIFI] %s\n", WiFi.localIP().toString().c_str());
+  return true;
+}
+
+void locateIfNeeded() {
+  // Locate once and cache. 0,0 is in the Atlantic, so it doubles as "unset".
+  // Runs on ANY online transition, not only the boot path: a clock that came up
+  // through the portal's retry used to never locate, so its temperature card
+  // stayed dark until a reboot with the network already up.
+  // A 1.1.0 clock already has lat/lon but no stored city; run once more for it.
+  if ((cfg.lat != 0 || cfg.lon != 0) && cfg.city[0]) return;
+  // At most once an hour: on a LAN with no internet this blocks for the HTTP
+  // timeout, and it used to do so on every reconnect.
+  static uint32_t lastTryMs = 0;
+  if (lastTryMs && millis() - lastTryMs < 3600000UL) return;
+  lastTryMs = millis();
+  String city;
+  if (geoLocate(cfg.lat, cfg.lon, city)) {
+    setField(cfg.city, sizeof cfg.city, city);
+    saveSettings(cfg);
+  }
+}
+
+// Everything that should happen when the clock gains the network, from whichever
+// state it came: boot, a drop that healed, or the portal's background retry.
+void onOnline() {
+  wasOnline = true;
+  everOnline = true;
+  lastConnectedMs = millis();
+  Serial.println("[STATE] -> online");
+  startWeb();
+  startMdns();
+  startOta();
+  if (!timeValid) startNtp();
+  locateIfNeeded();
 }
 
 void startPortal() {
@@ -952,7 +1317,7 @@ void startPortal() {
   if (mdnsUp) { MDNS.end(); mdnsUp = false; }
   WiFi.mode(WIFI_AP_STA);            // AP_STA, not AP: we keep retrying the
                                      // saved network while the portal is up.
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  WiFi.softAP(apSsid, AP_PASSWORD);
   // softAP() returns before the interface has its address; binding DNS to
   // 0.0.0.0 gives a portal that serves pages but never triggers the sign-in
   // sheet, which is a miserable thing to debug.
@@ -963,8 +1328,8 @@ void startPortal() {
   dns.start(53, "*", WiFi.softAPIP());
   if (!webUp) { startWeb(); }
   lastPortalTryMs = millis();
-  Serial.printf("[AP] %s  http://%s/\n", AP_SSID, WiFi.softAPIP().toString().c_str());
-  showWord("AP");
+  Serial.printf("[AP] %s  http://%s/\n", apSsid, WiFi.softAPIP().toString().c_str());
+  if (!timeValid) showWord("AP");    // once the time is known, paintFrame() keeps showing it
 }
 
 void stopPortal() {
@@ -974,54 +1339,6 @@ void stopPortal() {
   // The web server stays up — it is the settings page now, not the portal.
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
-  Serial.println("[STATE] -> online");
-  startMdns();
-  startOta();
-}
-
-// ---------------------------------------------------------------- wifi/ntp
-bool tryConnect() {
-  prefs.begin("wifi", true);
-  String ssid = prefs.getString("ssid", "");
-  String pass = prefs.getString("pass", "");
-  prefs.end();
-  if (ssid.isEmpty()) return false;
-
-  Serial.printf("[WIFI] connecting to %s\n", ssid.c_str());
-  WiFi.begin(ssid.c_str(), pass.c_str());
-
-  uint32_t t0 = millis();
-  uint8_t step = 0;
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS) {
-    if (!timeValid) showSpin(step++);   // once the time is known, keep showing it
-    else showTime();
-    delay(120);
-  }
-  if (WiFi.status() != WL_CONNECTED) { Serial.println("[WIFI] failed"); return false; }
-  Serial.printf("[WIFI] %s\n", WiFi.localIP().toString().c_str());
-  lastConnectedMs = millis();
-  return true;
-}
-
-bool syncTime() {
-  configTzTime(TZ_STRING, NTP_SERVER);
-  struct tm t;
-  uint32_t t0 = millis();
-  uint8_t step = 0;
-  while (millis() - t0 < NTP_TIMEOUT_MS) {
-    // getLocalTime() already rejects the 1970 default (it requires tm_year >
-    // 2016-1900), so this is belt-and-braces rather than the load-bearing check
-    // the old comment claimed.
-    if (getLocalTime(&t, 200) && t.tm_year > 120) {
-      timeValid = true; lastSyncMs = millis();
-      Serial.println("[NTP] ok");
-      return true;
-    }
-    if (!timeValid) showSpin(step++); else showTime();
-    delay(120);
-  }
-  Serial.println("[NTP] failed");
-  return false;
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -1032,6 +1349,8 @@ void setup() {
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 2000) delay(10);
   loadSettings(cfg);                 // defaults until the page has been used
+  snprintf(hostName, sizeof hostName, "%s", cfg.name);
+  snprintf(apSsid, sizeof apSsid, "%s-clock", cfg.name);
 
   // FastLED takes the pin as a TEMPLATE parameter, not an argument — the
   // clockless driver's bit timing is generated at compile time. So a runtime
@@ -1047,8 +1366,9 @@ void setup() {
     default: ledController = &FastLED.addLeds<WS2812, DEFAULT_DATA_PIN, GRB>(leds, activeLedCount(cfg));
              cfg.dataPin = DEFAULT_DATA_PIN; break;
   }
+  bootPin = cfg.dataPin;             // the page shows "restart to use GPIO n" only while this differs
   FastLED.setBrightness(cfg.brightness);
-// NO POWER CAP, DELIBERATELY.
+  // NO POWER CAP, DELIBERATELY.
   //
   // There was one, at 500 mA, carrying a comment about 32 x 60 mA = 1.9 A. Both
   // numbers were inherited from somewhere else: 60 mA is the 5050 WS2812B
@@ -1079,78 +1399,106 @@ void setup() {
       bp.end();
     }
   }
-  Serial.printf("[PWR] boot #%u, reset reason %s, brownouts so far %u\n",
-                bootCount, resetReasonName(), brownoutCount);
+  Serial.printf("[PWR] boot #%lu, reset reason %s, brownouts so far %lu, fw " FW_VERSION "\n",
+                (unsigned long)bootCount, resetReasonName(), (unsigned long)brownoutCount);
+  // "pending" right after an OTA means the bootloader is tracking this image and
+  // will roll back if it is not confirmed; "undefined" means it is not.
+  Serial.printf("[OTA] running image state: %s\n", otaStateName());
+  bootPending = imagePending();
   showSpin(0);
 
+  sntp_set_time_sync_notification_cb(onTimeSynced);
+  setenv("TZ", cfg.tz, 1); tzset();  // so the first paint after a sync is already local
+  WiFi.setHostname(hostName);        // the DHCP name the router shows; must precede mode()
   WiFi.mode(WIFI_STA);
   if (!hasCreds()) { startPortal(); return; }
 
   if (tryConnect()) {
-    startWeb();
-    startMdns();
-    startOta();
-    // Locate once and cache. 0,0 is in the Atlantic, so it doubles as "unset".
-    if (cfg.lat == 0 && cfg.lon == 0 && geoLocate(cfg.lat, cfg.lon, geoCity)) saveSettings(cfg);
-    // NTP failing is NOT a wifi problem. On a cold start after a power cut the
-    // router and the clock boot together and the clock wins the race to the
-    // internet; treating that as "bad credentials" used to send a perfectly
-    // configured device to the setup portal.
-    syncTime();
+    onOnline();
   } else {
-    startPortal();
+    // Credentials exist, so this is an outage — a router still booting after
+    // the same power cut, most likely — not a setup problem. Same ten-minute
+    // grace as a drop in service; loop() reconnects and raises the portal only
+    // after that. Raising it here put an open AP up after every power cut.
+    startWeb();
+    lastConnectedMs = millis();
   }
 }
 
 void loop() {
+  uint32_t now = millis();
+  confirmImage();                    // uptime-based; every branch reaches it
+
   if (portalUp) {
     dns.processNextRequest();
-    server.handleClient();
-
-    // The portal is not a dead end. If credentials exist, keep trying them —
-    // the network may simply have been down when we gave up.
-    if (millis() - lastPortalTryMs > PORTAL_RETRY_MS && hasCreds()) {
-      lastPortalTryMs = millis();
-      if (tryConnect()) {
-        // stopPortal() tears the AP down and brings mDNS up. Calling
-        // startMdns() here as well was a double MDNS.begin() with no end()
-        // between — and the first ran while the softAP was still up.
-        stopPortal();
-        if (!timeValid) syncTime();
+    pumpWeb();
+    if (WiFi.status() == WL_CONNECTED) {
+      // The portal is not a dead end. The background attempt landed: tear the
+      // AP down and come up as a normal clock.
+      stopPortal();
+      onOnline();
+    } else if (now - lastPortalTryMs > PORTAL_RETRY_MS) {
+      // Non-blocking: begin() and come back next pass. The old tryConnect()
+      // here froze the portal (DNS and HTTP) for 15 s of every 60 while the
+      // phone was trying to use it. A STA attempt can still bump the radio off
+      // the AP channel, so while a phone is attached the retry waits — but not
+      // forever: a parked phone must not pin the clock in the portal.
+      static uint32_t lastForcedMs = 0;
+      lastPortalTryMs = now;                       // stamped even with no creds, so hasCreds() is not polled every pass
+      bool phoneAttached = WiFi.softAPgetStationNum() > 0;
+      if (!phoneAttached || now - lastForcedMs > 5 * PORTAL_RETRY_MS) {
+        lastForcedMs = now;
+        if (hasCreds()) beginSta();
       }
     }
+    paintFrame();                    // the time, if known, not "AP" forever
     delay(5);
     return;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    // Keep showing the last known time, with digit 3's DP lit to say so.
-    showTime();
-    server.handleClient();
-    if (millis() - lastReconnectMs > RECONNECT_EVERY_MS) {
-      lastReconnectMs = millis();
-      Serial.println("[WIFI] dropped, reconnecting");
+    wasOnline = false;
+    pumpWeb();
+    if (now - lastReconnectMs > RECONNECT_EVERY_MS) {
+      lastReconnectMs = now;
+      Serial.println("[WIFI] reconnecting");
       WiFi.reconnect();
     }
     // Only after a genuinely long outage is it worth offering the portal — and
-    // even then it keeps retrying in the background.
-    if (millis() - lastConnectedMs > OFFLINE_TO_PORTAL_MS) {
-      timeValid = false;               // force a resync once we are back
-      startPortal();
-    }
-    delay(200);
+    // even then it keeps retrying in the background. timeValid is NOT cleared:
+    // the clock keeps showing the last known time, dot lit as the tell. A boot
+    // that has never associated gets the shorter grace: wrong credentials should
+    // not cost ten minutes, and the portal keeps trying the saved network anyway.
+    // A freshly installed image that cannot get online needs to become reachable
+    // before the confirm window closes, or a power cut in that window rolls it
+    // back for no reason of its own — so while the image is pending, the portal
+    // comes up after the confirm interval instead.
+    uint32_t grace = everOnline ? OFFLINE_TO_PORTAL_MS : (bootPending ? IMAGE_CONFIRM_MS : BOOT_OFFLINE_MS);
+    if (now - lastConnectedMs > grace) startPortal();
+    paintFrame();
+    delay(5);
     return;
   }
 
-  lastConnectedMs = millis();
-  server.handleClient();             // settings page, while the clock runs
+  if (!wasOnline) onOnline();        // a drop healed, or the boot-time attempt landed late
+  lastConnectedMs = now;
+  pumpWeb();
   ArduinoOTA.handle();
-  if (!timeValid) { syncTime(); return; }
+
+  if (!timeValid) {
+    // Waiting for the first reply. Re-kick SNTP once a minute in case the first
+    // request went out before the resolver was ready; keep serving everything.
+    if (!ntpStarted || now - lastNtpTryMs > NTP_RETRY_MS) startNtp();
+    paintFrame();
+    delay(5);
+    return;
+  }
 
   // The background SNTP poller refreshes every 3 h (CONFIG_LWIP_SNTP_UPDATE_DELAY
   // in the prebuilt core) and the C3's RTC free-runs on an uncalibrated
-  // oscillator, so pin it down periodically.
-  if (millis() - lastSyncMs > RESYNC_AFTER_MS) syncTime();
+  // oscillator, so re-kick it every 6 h as well. Whether a reply arrives is
+  // recorded by the callback, and /api reports minutes since the last real sync.
+  if (now - lastResyncMs > RESYNC_AFTER_MS) { lastResyncMs = now; startNtp(); }
 
   // Ticker: fetch on its own cache timer, scroll on the interval you set.
   // Guarded on timeValid so a clock that does not yet know the time never
@@ -1158,19 +1506,18 @@ void loop() {
   // The ticker paints straight into the buffer on its own path, so the gate in
   // showTime() does not cover it. A BTC scroll arriving mid-wizard would be a
   // baffling thing to be asked to identify.
-  if (cfg.tickMins && timeValid && !wiringOwnsPanel() &&
-      millis() - lastTickMs > cfg.tickMins * 60000UL) {
-    lastTickMs = millis();
+  if (cfg.tickMins && !wiringOwnsPanel() &&
+      now - lastTickMs > cfg.tickMins * 60000UL) {
+    lastTickMs = now;
     struct tm t;
     if (getLocalTime(&t, 50)) {
-      auto pump = [] { server.handleClient(); return serviceWiringPreview(); };
       if ((cfg.cards & CARD_BTC) && tickerFetch(btc))
-        tickerScroll(leds, btc, cfg, t, pump);
+        tickerScroll(leds, btc, cfg, t, pumpWeb);
       if ((cfg.cards & CARD_TEMP) && (cfg.lat || cfg.lon) && tickerWeather(btc, cfg.lat, cfg.lon))
-        tempShow(leds, btc, cfg, t, pump);
+        tempShow(leds, btc, cfg, t, pumpWeb);
     }
   }
 
-  showTime();
-  delay(200);
+  paintFrame();
+  delay(5);
 }

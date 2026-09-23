@@ -82,6 +82,16 @@ static constexpr uint8_t DEFAULT_DIGITS       = 4;
 static constexpr uint8_t DEFAULT_LEDS_PER_SEG = 1;
 static constexpr uint16_t DEFAULT_DP_MASK     = 0x000F;
 
+// Device identity and locale, settable from the page since 1.2.0. The defaults
+// reproduce every 1.1.0 device exactly: `mini7seg` is the DHCP hostname, the mDNS
+// name, the ArduinoOTA name and the stem of the setup AP's SSID; the timezone is
+// the POSIX rule that was compiled in before it became a setting.
+static constexpr uint8_t  DEV_NAME_MAX = 24;     // RFC 1123 label; a-z 0-9 '-'
+static constexpr uint8_t  TZ_RULE_MAX   = 47;     // longest common POSIX rule is ~40
+static constexpr uint8_t  CITY_NAME_MAX = 32;
+#define DEFAULT_NAME "mini7seg"
+#define DEFAULT_TZ   "PST8PDT,M3.2.0/2,M11.1.0/2"   // America/Los_Angeles
+
 enum Hue    : uint8_t { HUE_FIXED = 0, HUE_CYCLE, HUE_CHRONO, HUE_COUNT };
 enum Env    : uint8_t { ENV_NONE  = 0, ENV_BREATHE, ENV_COUNT };
 enum Colon  : uint8_t { COLON_BLINK = 0, COLON_ON, COLON_OFF };
@@ -112,7 +122,47 @@ struct Settings {
   uint16_t dpMask     = DEFAULT_DP_MASK;
   uint16_t stripLen   = 0;     // 0 = derive from the segments; else the real strip length
   uint16_t segBase[MAX_DIGITS][SEGMENT_COUNT] = {};
+  char     name[DEV_NAME_MAX + 1] = DEFAULT_NAME;   // hostname / mDNS / OTA / AP stem; restart to apply
+  char     tz[TZ_RULE_MAX + 1]     = DEFAULT_TZ;     // POSIX TZ rule, applied live
+  char     city[CITY_NAME_MAX + 1] = "";             // from geolocation, kept so the page can show it after a reboot
 };
+
+/** A hostname label: 1..DEV_NAME_MAX of a-z 0-9 '-', not starting or ending with '-'. */
+inline bool validName(const char* s) {
+  size_t n = strlen(s);
+  if (n < 1 || n > DEV_NAME_MAX) return false;
+  if (s[0] == '-' || s[n - 1] == '-') return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
+  }
+  return true;
+}
+
+/** A POSIX TZ rule: printable ASCII, 1..TZ_RULE_MAX, and it must carry an offset digit —
+ *  "PST8PDT,M3.2.0/2,M11.1.0/2" yes, "Pacific" no. The C library accepts a lot of
+ *  nonsense silently (it falls back to UTC), so this is the only guard the user gets. */
+inline bool validTz(const char* s) {
+  size_t n = strlen(s);
+  if (n < 1 || n > TZ_RULE_MAX) return false;
+  bool digit = false;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (c < 0x21 || c > 0x7E) return false;     // no spaces, no control, no high bytes
+    if (c >= '0' && c <= '9') digit = true;
+  }
+  return digit;
+}
+
+/** Copies a String into a fixed field, truncating on a UTF-8 boundary so a cut
+ *  city name never ends in half a character. Callers validate first. */
+inline void setField(char* dst, size_t cap, const String& src) {
+  size_t n = src.length() < cap - 1 ? src.length() : cap - 1;
+  if (n < src.length())                                   // truncated: back off over continuation bytes
+    while (n > 0 && ((uint8_t)src[n] & 0xC0) == 0x80) n--;
+  memcpy(dst, src.c_str(), n);
+  dst[n] = 0;
+}
 
 inline uint16_t activeSegmentCount(const Settings& s) {
   uint16_t n = (uint16_t)s.digits * (SEGMENT_COUNT - 1);
@@ -338,6 +388,30 @@ inline void loadSettings(Settings& s) {
   s.lat        = p.getFloat("lat",   s.lat);
   s.lon        = p.getFloat("lon",   s.lon);
   s.dataPin    = p.getUChar("pin",   s.dataPin);
+  // 1.2.0 keys. Absent on an updated 1.1.0 device -> the defaults above, which are
+  // exactly what that device was compiled with. A stored value that fails validation
+  // (corrupt NVS, or a future firmware with different rules) also falls back to the
+  // default rather than to whatever bytes are there.
+  {
+    String v = p.getString("name", DEFAULT_NAME);
+    if (validName(v.c_str())) setField(s.name, sizeof s.name, v);
+    v = p.getString("tz", DEFAULT_TZ);
+    if (validTz(v.c_str())) setField(s.tz, sizeof s.tz, v);
+    v = p.getString("city", "");
+    setField(s.city, sizeof s.city, v);
+  }
+  // Scalars the page cannot produce but corrupt NVS can. speed==21 would divide by
+  // zero in colourFor(); brightness below the page's floor reads as a dead panel.
+  if (s.speed < 1 || s.speed > 20) s.speed = 6;
+  if (s.brightness < 5) s.brightness = 5;
+  if (s.hue >= HUE_COUNT) s.hue = HUE_FIXED;
+  if (s.env >= ENV_COUNT) s.env = ENV_NONE;
+  if (s.colon > COLON_OFF) s.colon = COLON_BLINK;
+  if (s.secpath >= PATH_COUNT) s.secpath = PATH_OFF;
+  if (s.sectrail >= TRAIL_COUNT) s.sectrail = TRAIL_NONE;
+  if (s.spread > 64) s.spread = 64;
+  if (s.tickMins > 60) s.tickMins = 60;
+  if (s.cards > 3) s.cards = 3;
   p.end();
 }
 
@@ -359,10 +433,16 @@ inline bool saveSettings(const Settings& s) {
          && p.putUChar("lps", s.ledsPerSeg)
          && p.putUShort("dpmask", s.dpMask)
          && p.putUShort("striplen", s.stripLen)
-         && p.putBytes("segbase", s.segBase, sizeof(s.segBase)) == sizeof(s.segBase);
+         && p.putBytes("segbase", s.segBase, sizeof(s.segBase)) == sizeof(s.segBase)
+         && p.putString("name", s.name) > 0
+         && p.putString("tz", s.tz) > 0;
+  // These four can legitimately write zero bytes (lat/lon 0.0, pin 0, h12 false), so
+  // their return values say nothing about failure; NVS reports errors on the ones
+  // above, and a partition that fails there fails here too.
   p.putFloat("lat", s.lat); p.putFloat("lon", s.lon);
   p.putUChar("pin", s.dataPin);
-  p.putBool("h12", s.hour12);              // 0 is a legal size for `false`
+  p.putBool("h12", s.hour12);
+  p.putString("city", s.city);             // may be empty
   p.end();
   return ok;
 }
@@ -477,9 +557,12 @@ inline void applyLane(CRGB* leds, const SegmentRef* idx, uint8_t cnt, uint8_t he
   mark(idx[head % cnt], punch);       // head last, so it always wins
 }
 
-inline void applySeconds(CRGB* leds, uint16_t n, float secf, const Settings& s, const CRGB& tint) {
+inline void applySeconds(CRGB* leds, uint16_t n, float secf, const Settings& s, const CRGB& tint,
+                         uint8_t faceDigits = 0) {
   if (s.secpath == PATH_OFF || n == 0) return;
-  uint8_t nd = s.digits;
+  // Walk only the digits the face lit; a 5- or 7-digit panel has dark digits past
+  // the face that GHOST/ORBIT/RING would otherwise animate.
+  uint8_t nd = faceDigits ? min<uint8_t>(faceDigits, s.digits) : s.digits;
   if (nd == 0) return;
 
   uint16_t sec  = (uint16_t)secf;

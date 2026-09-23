@@ -1,4 +1,5 @@
-// Bitcoin price ticker: fetch, cache, and scroll across the four digits.
+// Network clients: one small HTTPS GET, the Bitcoin ticker, the weather card, and
+// IP geolocation.
 //
 // WHY IT SCROLLS AT ALL
 //   BTC is five digits ($81,552 at time of writing) and the panel has four, so
@@ -12,9 +13,17 @@
 //   label is bC — checked against getPattern(), not assumed.
 //
 // NETWORK FAILURE IS NOT A CLOCK FAILURE
-//   The fetch is cached and every error path leaves the last good price in
-//   place. A ticker that cannot reach CoinGecko must never take the clock down
-//   with it — the clock is the job, this is the party trick.
+//   Every fetch is cached and every error path leaves the last good value in
+//   place. A failed fetch also arms a back-off, so a dead WAN costs the clock one
+//   8 s stall every five minutes rather than one every tick. The clock is the
+//   job; this is the party trick.
+//
+// TLS IS VERIFIED (1.2.0)
+//   Every HTTPS client attaches the Mozilla root bundle that ESP-IDF already
+//   links into libmbedtls, so nothing here trusts an unverified server. That
+//   matters for the firmware download above all; the price and the weather get
+//   it for free. The bundle carries no clock dependency in this build
+//   (CONFIG_MBEDTLS_HAVE_TIME_DATE is off), so it works before NTP has landed.
 #pragma once
 #include <Arduino.h>
 #include <WiFi.h>
@@ -24,21 +33,24 @@
 
 #define TICKER_URL   "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
 // Plain HTTP on purpose: ip-api's free tier is HTTP-only, the payload is not
-// sensitive, and skipping a TLS handshake for one call at boot is worth it.
+// sensitive, and a wrong city costs a wrong temperature card, nothing more.
 #define GEO_URL      "http://ip-api.com/json/?fields=status,city,lat,lon"
 #define WX_URL       "https://api.open-meteo.com/v1/forecast?current=temperature_2m&temperature_unit=fahrenheit&latitude="
-#define WX_CACHE     600000UL     // weather moves slowly; 10 min is plenty
-#define TICKER_CACHE 120000UL     // don't hammer the free API: 2 min minimum
+#define WX_CACHE       600000UL   // weather moves slowly; 10 min is plenty
+#define TICKER_CACHE   120000UL   // don't hammer the free API: 2 min minimum
+#define NET_BACKOFF_MS 300000UL   // after a failure, leave that endpoint alone for 5 min
 #define TICKER_STEP_MS 430        // per frame; 300 was brisk enough to be work to read
 #define TICKER_PASSES  2          // a glance that arrives mid-scroll still gets it
 
 struct Ticker {
   long     usd       = 0;         // 0 = never successfully fetched
   uint32_t fetchedMs = 0;
+  uint32_t failMs    = 0;         // last failed price fetch, for the back-off
   bool     ok        = false;
 
   float    tempF     = 0;
   uint32_t wxMs      = 0;
+  uint32_t wxFailMs  = 0;
   bool     wxOk      = false;
 };
 
@@ -47,27 +59,50 @@ struct Ticker {
 #define CARD_BTC   0x01
 #define CARD_TEMP  0x02
 
+// The root bundle ESP-IDF embeds in libmbedtls (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE).
+// esp_crt_bundle_attach() would use it by default; NetworkClientSecure only exposes
+// the attach path through setCACertBundle(), which wants the bytes, so hand it the
+// same bytes it would have used anyway.
+extern const uint8_t x509_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t x509_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
+
+inline void trustRootBundle(WiFiClientSecure& c) {
+  c.setCACertBundle(x509_crt_bundle_start, (size_t)(x509_crt_bundle_end - x509_crt_bundle_start));
+}
+
 /** One small GET into a String. Every caller treats failure as "keep the last
- *  good value", so this returns empty rather than throwing a wobbly. */
-inline String httpGet(const char* url, bool secure) {
+ *  good value", so this returns empty rather than throwing a wobbly. The HTTP
+ *  status (or 0 for no connection / TLS failure) comes back through `code` so the
+ *  caller can tell "no such release" (404) from "rate limited" (403) from "offline". */
+inline String httpGet(const char* url, bool secure, int* code = nullptr) {
+  if (code) *code = 0;
   if (WiFi.status() != WL_CONNECTED) return "";
+  // Declared BEFORE the HTTPClient so it outlives it: HTTPClient's destructor
+  // still touches the client it was given, and the previous ordering destroyed
+  // the TLS client first.
+  WiFiClientSecure tls;
+  WiFiClient plain;
   HTTPClient http;
   bool begun;
-  WiFiClientSecure tls;
-  if (secure) { tls.setInsecure(); tls.setTimeout(8); begun = http.begin(tls, url); }
-  else        { begun = http.begin(url); }
+  if (secure) { trustRootBundle(tls); begun = http.begin(tls, url); }
+  else        { begun = http.begin(plain, url); }
   if (!begun) return "";
+  // Both in milliseconds, both on HTTPClient, which propagates them to the client
+  // it was handed. (setTimeout on the client itself is ambiguous between Stream's
+  // milliseconds and the socket's seconds, so it is not used here.)
+  http.setConnectTimeout(8000);
   http.setTimeout(8000);
-  int code = http.GET();
-  String body = (code == 200) ? http.getString() : String("");
-  if (code != 200) Serial.printf("[NET] %s -> %d\n", url, code);
+  int status = http.GET();
+  if (code) *code = status > 0 ? status : 0;
+  String body = (status == 200) ? http.getString() : String("");
+  if (status != 200) Serial.printf("[NET] %s -> %d\n", url, status);
   http.end();
   return body;
 }
 
-/** Locate by public IP. Called once and cached to NVS — the clock only moves
- *  house occasionally, and the answer is good to a few miles which is well
- *  inside the resolution of "what is the temperature outside". */
+/** Locate by public IP. The caller stores lat/lon/city in Settings — the clock
+ *  only moves house occasionally, and the answer is good to a few miles which is
+ *  well inside the resolution of "what is the temperature outside". */
 inline bool geoLocate(float& lat, float& lon, String& city) {
   String b = httpGet(GEO_URL, false);
   if (b.indexOf("\"status\":\"success\"") < 0) return false;
@@ -75,23 +110,23 @@ inline bool geoLocate(float& lat, float& lon, String& city) {
   if (la < 0 || lo < 0) return false;
   lat = b.substring(la + 6).toFloat();
   lon = b.substring(lo + 6).toFloat();
-  if (ci >= 0) { int e = b.indexOf('"', ci + 8); city = b.substring(ci + 8, e); }
+  if (ci >= 0) { int e = b.indexOf('"', ci + 8); if (e > ci) city = b.substring(ci + 8, e); }
   Serial.printf("[GEO] %s  %.4f, %.4f\n", city.c_str(), lat, lon);
   return true;
 }
 
 inline bool tickerWeather(Ticker& tk, float lat, float lon) {
   if (tk.wxOk && millis() - tk.wxMs < WX_CACHE) return true;
+  if (tk.wxFailMs && millis() - tk.wxFailMs < NET_BACKOFF_MS) return tk.wxOk;   // backing off
   char url[200];
   snprintf(url, sizeof url, "%s%.4f&longitude=%.4f", WX_URL, lat, lon);
   String b = httpGet(url, true);
-  int k = b.indexOf("\"temperature_2m\":");
   // The key appears twice — once in current_units as a string, once in current
   // as the number. lastIndexOf gets the value, indexOf would get "°F".
-  k = b.lastIndexOf("\"temperature_2m\":");
-  if (k < 0) return false;
+  int k = b.lastIndexOf("\"temperature_2m\":");
+  if (k < 0) { tk.wxFailMs = millis(); return tk.wxOk; }
   tk.tempF = b.substring(k + 17).toFloat();   // "temperature_2m": is 17 chars
-  tk.wxOk = true; tk.wxMs = millis();
+  tk.wxOk = true; tk.wxMs = millis(); tk.wxFailMs = 0;
   Serial.printf("[WX] %.1f F\n", tk.tempF);
   return true;
 }
@@ -118,33 +153,22 @@ inline void tempShow(CRGB* leds, const Ticker& tk, const Settings& s,
 inline bool tickerFetch(Ticker& tk) {
   if (WiFi.status() != WL_CONNECTED) return false;
   if (tk.ok && millis() - tk.fetchedMs < TICKER_CACHE) return true;   // still fresh
+  if (tk.failMs && millis() - tk.failMs < NET_BACKOFF_MS) return tk.ok;   // backing off
 
-  WiFiClientSecure client;
-  // No cert pinning. This is a public price feed on a decorative display; the
-  // worst case of a spoofed response is a wrong number on a clock. Carrying a
-  // root bundle that expires would be the bigger liability.
-  client.setInsecure();
-  client.setTimeout(8);
-
-  HTTPClient http;
-  if (!http.begin(client, TICKER_URL)) return false;
-  http.setTimeout(8000);
-  int code = http.GET();
-  if (code != 200) { http.end(); Serial.printf("[BTC] http %d\n", code); return false; }
-
-  String body = http.getString();
-  http.end();
+  String body = httpGet(TICKER_URL, true);
+  if (body.isEmpty()) { tk.failMs = millis(); return tk.ok; }
 
   // {"bitcoin":{"usd":81552}} — a whole JSON parser for one integer would cost
   // more flash than the rest of this file.
   int k = body.indexOf("\"usd\":");
-  if (k < 0) { Serial.println("[BTC] no usd field"); return false; }
+  if (k < 0) { Serial.println("[BTC] no usd field"); tk.failMs = millis(); return tk.ok; }
   long v = body.substring(k + 6).toInt();
-  if (v <= 0) { Serial.println("[BTC] unparseable"); return false; }
+  if (v <= 0) { Serial.println("[BTC] unparseable"); tk.failMs = millis(); return tk.ok; }
 
   tk.usd = v;
   tk.ok = true;
   tk.fetchedMs = millis();
+  tk.failMs = 0;
   Serial.printf("[BTC] $%ld\n", v);
   return true;
 }

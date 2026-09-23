@@ -10,21 +10,30 @@
 // asks the builder for the one fact they do not have: the order they happened to
 // solder in. This lights one LED group and asks what they see, which is a
 // question anyone can answer while looking at the bench.
+//
+// 1.2.0: requests are queued, never dropped (a dropped final save lost a whole
+// wizard run); a save is judged by the reply's ok field, so "Saved." means saved;
+// turning a decimal point off clears its table cell; changing LEDs-per-segment
+// rescales the learned table instead of sending one that overlaps itself; the
+// shape controls lock while Learn is running.
 #pragma once
 #include <Arduino.h>
 
 const char GEOMETRY_HTML[] PROGMEM = R"HTML(<!doctype html>
+<html lang=en>
 <meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>mini7seg geometry</title>
 <style>
-:root{--bg:#0d0f13;--fg:#e8eaed;--mut:#8b929c;--line:#252a32;--acc:#00a0ff}
+:root{--bg:#0d0f13;--fg:#e8eaed;--mut:#8b929c;--line:#252a32;--acc:#00a0ff;--bad:#ff6b6b}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,sans-serif}
 .w{max-width:26rem;margin:0 auto;padding:1.5rem 1.1rem 3rem}
 h1{font-size:1.1rem;margin:0 0 .2rem}
-.sub{color:var(--mut);font-size:.82rem;margin:0 0 1.6rem}
+.sub{color:var(--mut);font-size:.82rem;margin:0 0 1.6rem;min-height:1.2em}
+.sub.bad{color:var(--bad)}
 fieldset{border:0;padding:0;margin:0 0 1.5rem}
+fieldset[disabled]{opacity:.45}
 legend{font-size:.72rem;text-transform:uppercase;letter-spacing:.09em;color:var(--mut);padding:0 0 .5rem}
 .modes{display:grid;grid-template-columns:repeat(2,1fr);gap:.5rem}
 .modes button{padding:.7rem .5rem;border:1px solid var(--line);background:#151920;color:var(--fg);
@@ -34,6 +43,7 @@ legend{font-size:.72rem;text-transform:uppercase;letter-spacing:.09em;color:var(
 .row label{flex:1;font-size:.92rem}
 .row output{color:var(--mut);font-variant-numeric:tabular-nums;font-size:.85rem;min-width:2.6rem;text-align:right}
 input[type=range]{flex:2;accent-color:var(--acc)}
+input[type=number]{flex:2;background:#151920;color:var(--fg);border:1px solid var(--line);border-radius:.4rem;padding:.45rem;font:inherit}
 .seg{display:flex;gap:.3rem;flex-wrap:wrap}
 .seg button{flex:1;min-width:2.2rem;padding:.5rem;border:1px solid var(--line);background:#151920;color:var(--fg);
  border-radius:.4rem;font:inherit;font-size:.82rem;cursor:pointer}
@@ -50,15 +60,15 @@ svg text{fill:var(--mut);font-size:15px;pointer-events:none}
 <h1>display geometry</h1>
 <p class=sub id=stat>Loading...</p>
 
-<fieldset><legend>Shape</legend>
+<fieldset id=shape><legend>Shape</legend>
 <div class=row><label for=nd>Digits</label><input type=range id=nd min=1 max=8><output id=ndv></output></div>
 <div class=row><label for=lp>LEDs per segment</label><input type=range id=lp min=1 max=8><output id=lpv></output></div>
-<div class=row><label for=sl>Total LEDs on strip</label><input type=number id=sl min=0 max=512 style="flex:2;background:#151920;color:var(--fg);border:1px solid var(--line);border-radius:.4rem;padding:.45rem"><output id=slv></output></div>
-<div class=row><label>Decimal points</label><div class=seg id=dp></div></div>
+<div class=row><label for=sl>Total LEDs on strip</label><input type=number id=sl min=0 max=512><output id=slv></output></div>
+<div class=row><label id=dpl>Decimal points</label><div class=seg id=dp aria-labelledby=dpl></div></div>
 </fieldset>
 
 <fieldset><legend>Map</legend>
-<svg id=svg></svg>
+<svg id=svg role=img aria-label="the display, one polygon per segment"></svg>
 <p class=note id=hint style="border:0;padding:.7rem 0 0;margin:0"></p>
 <div class=modes id=act style="margin-top:.6rem">
 <button id=bid>Identify</button><button id=blr>Learn wiring</button></div>
@@ -67,21 +77,23 @@ svg text{fill:var(--mut);font-size:15px;pointer-events:none}
 <button id=bdone>Finish</button><button id=bstop>Cancel</button></div>
 </fieldset>
 
-<fieldset><legend>Reset</legend>
+<fieldset id=rst><legend>Reset</legend>
 <div class=seg><button id=brst>Reset to standard wiring</button></div>
 </fieldset>
 
 <p class=note id=note>Learn mode lights one LED group at a time and asks which segment it was, so you never have to know your own wiring. The picture fills in as you go.</p>
+<p class=note style="border:0"><a href="/" style="color:var(--acc)">&larr; back to settings</a></p>
 </div>
 <script>
 const $=i=>document.getElementById(i);
 const AB=65535;   // absent segment; must match SEGMENT_ABSENT in settings.h
 const NM=['A top','B top right','C bottom right','D bottom','E bottom left','F top left','G middle','DP'];
-let G={digits:4,ledsPerSeg:1,dpMask:0,segBase:[]},mode=0,step=0,tbl=null,busy=0,lastD=0,lastS=0;
-const H=(x,y,w)=>[[x,y+7],[x+7,y],[x+w-7,y],[x+w,y+7],[x+w-7,y+14],[x+7,y+14]].join(' ');
+const H={method:'POST',headers:{'X-7seg':'1'}};
+let G={digits:4,ledsPerSeg:1,dpMask:0,segBase:[]},mode=0,step=0,tbl=null,lastD=-1,lastS=-1;
+const Hx=(x,y,w)=>[[x,y+7],[x+7,y],[x+w-7,y],[x+w,y+7],[x+w-7,y+14],[x+7,y+14]].join(' ');
 const V=(x,y,h)=>[[x+7,y],[x+14,y+7],[x+14,y+h-7],[x+7,y+h],[x,y+h-7],[x,y+7]].join(' ');
-const P=[H(6,6,72),V(64,22,49),V(64,89,49),H(6,140,72),V(6,89,49),V(6,22,49),H(6,73,72)];
-const say=t=>$('stat').textContent=t;
+const P=[Hx(6,6,72),V(64,22,49),V(64,89,49),Hx(6,140,72),V(6,89,49),V(6,22,49),Hx(6,73,72)];
+const say=(t,bad)=>{const s=$('stat');s.textContent=t;s.className='sub'+(bad?' bad':'')};
 const tab=()=>mode==2?tbl:G.segBase;
 const has=(d,s)=>{const t=tab()[d];return t&&t[s]!=AB?'on':''};
 // Finished means every segment has an LED, not every LED has been offered.
@@ -112,33 +124,48 @@ function paint(){
   $('bid').setAttribute('aria-pressed',mode==1);
   $('blr').setAttribute('aria-pressed',mode==2);
   $('nav').style.display=mode==2?'flex':'none';
+  // Changing the shape mid-wizard would leave the table short and cancel the lit
+  // group; Identify mid-wizard would drop the table without a save.
+  $('shape').disabled=mode==2;$('rst').disabled=mode!=0;$('bid').disabled=mode==2;
   $('hint').innerHTML=mode==2?
-    '<b>Group '+step+' of '+G.digits*8+'</b> is lit (LED '+step*G.ledsPerSeg+
-    '+). Click the segment that lit up, or Skip if nothing did. Clock is paused.'+
+    '<b>Group '+(step+1)+' of '+groups()+'</b> is lit (LED '+step*G.ledsPerSeg+
+    (G.ledsPerSeg>1?'-'+(step*G.ledsPerSeg+G.ledsPerSeg-1):'')+'). Click the segment that lit up, or Skip if nothing did. Clock is paused.'+
     '<br>Mapped <b>'+got()+' of '+need()+'</b> segments.':
    mode==1?'Click any segment and it stays lit on the display. Clock is paused.':
    'Identify tests the map you have. Learn wiring builds it from nothing.';
 }
-function get(u,ok){
-  if(busy)return;busy=1;
-  fetch(u).then(r=>r.json()).then(j=>{busy=0;ok(j)})
-   .catch(()=>{busy=0;say('Clock did not answer. Try that again.')});
-}
+// Serialised, never dropped. The old version silently ignored a request while one
+// was in flight, which lost the final save of a finished wizard run.
+let Q=Promise.resolve();
+function post(u,ok){Q=Q.then(()=>fetch(u,H).then(r=>r.json()).then(ok))
+  .catch(()=>say('Clock did not answer. Try that again.',true));return Q}
 const flat=()=>{let a=[],d,i,t=tab();
-  for(d=0;d<G.digits;d++)for(i=0;i<8;i++)a.push(t[d]&&t[d][i]!=null?t[d][i]:AB);
+  for(d=0;d<G.digits;d++)for(i=0;i<8;i++)
+    a.push(i==7&&!(G.dpMask&(1<<d))?AB:(t[d]&&t[d][i]!=null?t[d][i]:AB));   // a cleared DP sends ABSENT
   return a.join(',')};
-const push=()=>get('/setgeometry?digits='+G.digits+'&ledsPerSeg='+G.ledsPerSeg+'&dpMask='+G.dpMask+'&stripLen='+(G.stripLen||0)+'&segBase='+flat(),
-  j=>{say(j.ok?'Saved.':'Rejected: '+(j.err||'unknown'));if(!j.ok)load()});
-const load=()=>get('/geometry',j=>{G=j;G.segBase=G.segBase||[];say('Loaded.');paint()});
+// A save is judged by what the firmware said: ok:false is a rejection (reload the
+// truth), anything else IS the new geometry.
+const push=msg=>post('/setgeometry?digits='+G.digits+'&ledsPerSeg='+G.ledsPerSeg+'&dpMask='+G.dpMask+'&stripLen='+(G.stripLen||0)+'&segBase='+flat(),
+  j=>{if(j.ok===false){say('Rejected: '+(j.error||'unknown'),true);load()}else{G=j;G.segBase=G.segBase||[];say(msg||'Saved.');paint()}});
+const load=()=>fetch('/geometry').then(r=>r.json()).then(j=>{G=j;G.segBase=G.segBase||[];say('Loaded.');paint()})
+  .catch(()=>say('Clock did not answer.',true));
 const blank=()=>{let a=[],d;for(d=0;d<G.digits;d++)a.push([AB,AB,AB,AB,AB,AB,AB,AB]);return a};
-$('nd').oninput=e=>{G.digits=+e.target.value;
+$('nd').oninput=e=>{$('ndv').textContent=e.target.value};
+$('nd').onchange=e=>{G.digits=+e.target.value;
   while(G.segBase.length<G.digits)G.segBase.push([AB,AB,AB,AB,AB,AB,AB,AB]);
   paint();push()};
-$('lp').oninput=e=>{G.ledsPerSeg=+e.target.value;paint();push()};
+$('lp').oninput=e=>{$('lpv').textContent=e.target.value};
+$('lp').onchange=e=>{const o=G.ledsPerSeg,n=+e.target.value;
+  // Rescale the learned order: base indices are group*ledsPerSeg, so keep the group.
+  G.segBase=G.segBase.map(r=>r.map(v=>v==AB?AB:Math.round(v/o)*n));G.ledsPerSeg=n;paint();push()};
 $('sl').onchange=e=>{G.stripLen=+e.target.value||0;push()};
-$('bdone').onclick=()=>{if(mode==2)finish(got()>=need())};
-$('dp').onclick=e=>{if(e.target.dataset.d===undefined)return;
-  G.dpMask^=1<<+e.target.dataset.d;paint();push()};
+$('dp').onclick=e=>{if(e.target.dataset.d===undefined)return;const d=+e.target.dataset.d;
+  G.dpMask^=1<<d;
+  const on=!!(G.dpMask&(1<<d));
+  if(!on&&G.segBase[d])G.segBase[d][7]=AB;    // off: forget its LED, or the firmware rejects the table
+  paint();
+  // On, with no LED known for it yet: the save succeeds but the dot has nothing to light.
+  push(on&&(!G.segBase[d]||G.segBase[d][7]==AB)?'Saved. Digit '+(d+1)+' has a decimal point but no LED for it yet - run Learn wiring, or Reset to standard wiring.':undefined)};
 $('svg').onclick=e=>{
   const id=e.target.id;if(!id||id[0]!='p')return;
   const p=id.substr(1).split('_'),d=+p[0],s=+p[1];
@@ -146,37 +173,41 @@ $('svg').onclick=e=>{
     [].forEach.call(document.querySelectorAll('#svg .hot'),x=>x.classList.remove('hot'));
     e.target.classList.add('hot');
     lastD=d;lastS=s;
-    get('/identify?d='+d+'&s='+s,()=>say('Digit '+d+', segment '+NM[s]+' -- still lit.'));
+    post('/identify?d='+d+'&s='+s,j=>say(j.ok===false?'Refused: '+(j.error||'?'):'Digit '+(d+1)+', segment '+NM[s]+' -- still lit.',j.ok===false));
     return}
   if(mode!=2)return;
+  if(!tbl[d])return;
   tbl[d][s]=step*G.ledsPerSeg;step++;advance();
 };
 function finish(done){
-  mode=0;G.segBase=tbl;tbl=null;fetch('/probe?i=-1').catch(()=>{});paint();push();
-  say(done?'All '+need()+' segments mapped. Clock resumed.':
-           'Stopped with '+got()+' of '+need()+' mapped. Clock resumed.');
+  const msg=done?'All '+need()+' segments mapped. Clock resumed.':'Stopped with '+got()+' of '+need()+' mapped. Clock resumed.';
+  mode=0;G.segBase=tbl;tbl=null;post('/probe?i=-1',()=>{});paint();push(msg);
 }
 function advance(){
   if(got()>=need()){finish(true);return}          // every segment has an LED
   if(step>=groups()){finish(false);return}        // ran out of strip
   paint();
-  get('/probe?i='+step,j=>{if(j&&j.ok===false)say('Probe refused: '+(j.err||'?'))});
+  post('/probe?i='+step,j=>{if(j&&j.ok===false)say('Probe refused: '+(j.error||'?'),true)});
 }
-$('bid').onclick=()=>{mode=mode==1?0:1;fetch('/probe?i=-1').catch(()=>{});paint()};
+$('bid').onclick=()=>{mode=mode==1?0:1;lastD=-1;lastS=-1;post('/probe?i=-1',()=>{});paint()};
 $('blr').onclick=()=>{mode=2;step=0;tbl=blank();advance()};
-$('bstop').onclick=()=>{mode=0;tbl=null;fetch('/probe?i=-1').catch(()=>{});load()};
+$('bstop').onclick=()=>{mode=0;tbl=null;post('/probe?i=-1',()=>{});load()};
 $('bskip').onclick=()=>{step++;advance()};
+$('bdone').onclick=()=>{if(mode==2)finish(got()>=need())};
 $('bback').onclick=()=>{if(step<1)return;step--;
   let d,i;for(d=0;d<G.digits;d++)for(i=0;i<8;i++)if(tbl[d][i]==step*G.ledsPerSeg)tbl[d][i]=AB;
   advance()};
 $('brst').onclick=()=>{let n=0,d,i,a=blank();
   for(d=0;d<G.digits;d++){for(i=0;i<7;i++)a[d][i]=n++*G.ledsPerSeg;
     if(G.dpMask&(1<<d))a[d][7]=n++*G.ledsPerSeg}
-  G.segBase=a;mode=0;tbl=null;paint();push()};
+  G.segBase=a;mode=0;tbl=null;paint();push('Standard wiring restored.')};
+// Keep the latched preview alive while the page is open; only re-send an Identify
+// that was actually clicked.
 setInterval(()=>{if(!mode)return;
-  if(mode==2)fetch('/probe?i='+step).catch(()=>{});
-  else fetch('/identify?d='+lastD+'&s='+lastS).catch(()=>{});},120000);
-addEventListener('pagehide',()=>{if(mode)fetch('/probe?i=-1',{keepalive:true}).catch(()=>{})});
+  const u=mode==2?'/probe?i='+step:(lastD>=0?'/identify?d='+lastD+'&s='+lastS:null);
+  if(u)post(u,()=>{});},120000);   // through the queue, so it can never overtake a click
+addEventListener('pagehide',()=>{if(mode)fetch('/probe?i=-1',Object.assign({keepalive:true},H)).catch(()=>{})});
 load();
 </script>
+</html>
 )HTML";

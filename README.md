@@ -10,12 +10,15 @@ rather than appearing and failing.
 
 ## What it does
 
-- Joins wifi through a captive setup portal on first boot; falls back to that
-  portal if it ever cannot connect, and keeps retrying the saved network in the
-  background so the portal is never a dead end.
-- Gets the time by NTP with a POSIX timezone string, so DST rolls on its own.
-- Serves a settings page at `mini7seg.local`, and takes firmware uploads at
-  `mini7seg.local/update`.
+- Joins wifi through a captive setup portal on first boot. If it later cannot
+  connect it keeps showing the time, retries in the background, and only after
+  a few minutes raises the portal — which keeps retrying too, so it is never a
+  dead end and never a reflex.
+- Gets the time by NTP with a POSIX timezone rule you pick on the page, so DST
+  rolls on its own; the page shows how long ago the last real sync landed.
+- Serves a settings page and a wiring editor at `mini7seg.local` (or the name
+  you give it), takes firmware uploads at `/update`, and updates itself from
+  this repo's releases.
 
 ## The display
 
@@ -153,9 +156,12 @@ needs its own verified pin allow-list and a board on the bench.
 ## Updating
 
 A clock already on your network updates itself: open `mini7seg.local`, press
-**Check for updates** under Firmware. It asks GitHub for the newest release tag,
-compares it to what it is running, and pulls
-`releases/latest/download/firmware.bin` if there is something newer.
+**Check for updates** under Firmware. It asks GitHub for the newest release tag
+and compares it to what it is running. **Install** then asks again, refuses
+unless the release is strictly newer, and downloads that exact tag's
+`firmware.bin` over verified TLS (1.2.0 and later; 1.0.0 and 1.1.0 devices pull
+`releases/latest/download/firmware.bin` without checking, which is why the
+release contract below never changes).
 
 The browser installer at [mcyork.github.io/7segclock](https://mcyork.github.io/7segclock/)
 is for a *new* device, or one that will not boot — those need a cable and a full
@@ -170,18 +176,35 @@ factory image, which a running clock cannot install on itself.
 
 That asymmetry is not tidiness, it is the only arrangement that works.
 
-## Timezone and trust model
+## Timezone, name, network
 
-This build shows **US Pacific time** (`TZ_STRING` in `src/main.cpp`, DST handled
-by the POSIX rule). A timezone setting on the settings page is planned for the
-next firmware; until then another zone means changing that one line and
-rebuilding.
+Since 1.2.0 these are settings, not compile-time constants. The settings page
+has a **Timezone** picker (common zones, or any POSIX rule such as
+`CET-1CEST,M3.5.0,M10.5.0/3`) that applies live, so daylight saving rolls on its
+own; a **Device name** (default `mini7seg`) that becomes the hostname, the mDNS
+name, the ArduinoOTA name and the stem of the setup network, so two clocks can
+share a LAN; a **Network** section to move the clock to another WiFi without
+waiting for the portal; and a **Factory reset**. A device updated from 1.1.0
+comes up with exactly the values it was compiled with.
 
-The settings page, the wiring editor, `/update`, the self-update trigger and
-ArduinoOTA have **no password**. Anyone on the same network can change settings
-or flash firmware. The setup access point uses a fixed, published password. Run
-the clock on a network you trust; hardening (POST-only routes, a request token,
-an OTA password) is on the list for the next firmware.
+## Trust model
+
+Every route that changes state requires `POST` and the header `X-7seg: 1`. A
+web page on another origin can make your browser send a `GET` or a form `POST`
+to the clock's LAN address, but it cannot add a custom header without a CORS
+preflight, which the clock never answers — so a stray `<img src=...>` cannot
+change the pin or wipe a wiring map any more. There is still **no password**:
+anyone on your network who opens the page can use everything on it, including
+`/update` and the self-update trigger, and ArduinoOTA accepts any host on the
+LAN. The setup access point uses a fixed, published password. Run the clock on
+a network you trust.
+
+Firmware downloads verify the server certificate against the Mozilla root
+bundle ESP-IDF ships; the self-update only installs a release that is strictly
+newer than what is running, and downloads the exact tag it verified. A freshly
+installed image has to run for a minute and be reachable before the bootloader
+is told to keep it; if it never gets there, the next boot returns to the
+previous image.
 
 ## Repos
 

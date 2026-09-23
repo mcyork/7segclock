@@ -235,6 +235,36 @@ function requireStrings(check: string, label: string, buf: Buffer, needles: stri
   }
 }
 
+/** The FW_VERSION literal is a NUL-terminated C string. Searching for "\0X.Y.Z\0" rather
+ *  than the bare digits means a timezone rule like "M3.2.0" or a library version cannot
+ *  satisfy the check by accident. */
+function requireVersionLiteral(check: string, label: string, buf: Buffer, version: string): void {
+  if (!buf.includes(Buffer.from(`\0${version}\0`, "ascii"))) fail(check, `${label} does not contain FW_VERSION "${version}" as a string literal`);
+}
+
+/** sha256 over the sources the binary was built from, as they are on disk (working tree) or
+ *  as committed at a ref — so --publish can prove the tag's sources are what --build compiled. */
+const BUILD_INPUTS = ["platformio.ini", "src/main.cpp", "src/settings.h", "src/ticker.h", "src/webui.h", "src/geometryui.h"];
+const BUILT_FROM = join(REPO_ROOT, `.pio/build/${PIO_ENV}/built-from.sha256`);
+
+function sourcesDigest(reader: (path: string) => Buffer): string {
+  const h = createHash("sha256");
+  for (const p of BUILD_INPUTS) { h.update(p); h.update("\0"); h.update(reader(p)); h.update("\0"); }
+  return h.digest("hex");
+}
+
+function workingTreeDigest(): string {
+  return sourcesDigest((p) => readBinary("sources", join(REPO_ROOT, p)));
+}
+
+function committedDigest(ref: string): string {
+  return sourcesDigest((p) => {
+    const res = run(["git", "show", `${ref}:${p}`], LOCAL_GIT_MS);
+    if (res.exitCode !== 0) fail("sources", `git show ${ref}:${p} exited ${res.exitCode}: ${firstLine(res.stderr)}`);
+    return Buffer.from(res.stdout, "utf8");
+  });
+}
+
 function hex(n: number): string {
   return `0x${n.toString(16).toUpperCase()}`;
 }
@@ -244,10 +274,12 @@ function verifyArtefacts(version: string): Artefacts {
   const app = readBinary("app-image", APP_BIN);
   if (app.length > MAX_APP_BYTES) fail("app-size", `firmware.bin is ${app.length} bytes (${hex(app.length)}), over the ${hex(MAX_APP_BYTES)} OTA slot`);
   if (app.length === 0 || app[0] !== ESP_IMAGE_MAGIC) fail("app-magic", `firmware.bin starts with ${app.length ? hex(app[0] ?? 0) : "nothing"}, not the ESP image magic 0xE9`);
-  requireStrings("app-image", "firmware.bin", app, [UPDATE_MARKER, version]);
+  requireStrings("app-image", "firmware.bin", app, [UPDATE_MARKER]);
+  requireVersionLiteral("app-image", "firmware.bin", app, version);
 
   const factory = readBinary("factory-image", FACTORY_BIN);
-  requireStrings("factory-image", "firmware.factory.bin", factory, [UPDATE_MARKER, version]);
+  requireStrings("factory-image", "firmware.factory.bin", factory, [UPDATE_MARKER]);
+  requireVersionLiteral("factory-image", "firmware.factory.bin", factory, version);
   if (factory.length <= app.length) fail("factory-image", `firmware.factory.bin (${factory.length} B) is not larger than firmware.bin (${app.length} B)`);
   if (!factory.includes(app)) fail("factory-image", "firmware.factory.bin does not contain firmware.bin verbatim — the two images are from different builds");
 
@@ -354,6 +386,38 @@ function checkManifest(version: string): string {
   return `version ${found}`;
 }
 
+/** Three numeric parts, strictly greater. Mirrors isNewer() in the firmware. */
+function isNewer(a: string, b: string): boolean {
+  const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) { if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) > (pb[i] ?? 0); }
+  return false;
+}
+
+/** FW_VERSION must be newer than whatever GitHub already calls latest: fielded devices
+ *  compare against that tag, and a release that is not newer is one nobody can install. */
+function checkNewerThanLatest(version: string): string {
+  const gh = Bun.which("gh") ?? fail("latest", "gh CLI not found on PATH");
+  const res = run([gh, "api", `repos/${REPO_SLUG}/releases/latest`, "--jq", ".tag_name"], GH_MS);
+  if (res.exitCode !== 0) {
+    if (/404|Not Found/i.test(res.stderr + res.stdout)) return "no release published yet";
+    fail("latest", `gh api releases/latest exited ${res.exitCode}: ${firstLine(res.stderr)}`);
+  }
+  const raw = res.stdout.trim();
+  const latest = raw.startsWith("v") ? raw.slice(1) : raw;
+  if (!/^\d+\.\d+\.\d+$/.test(latest)) fail("latest", `latest release tag "${raw}" is not vX.Y.Z`);
+  if (!isNewer(version, latest)) fail("latest", `FW_VERSION ${version} is not newer than the published latest ${raw} — bump it`);
+  return `${version} > ${raw}`;
+}
+
+/** The binary in .pio/ must have been built from exactly the sources the release commit carries. */
+function checkBuiltFromHead(): string {
+  const recorded = readText("built-from", BUILT_FROM).trim();
+  if (!/^[0-9a-f]{64}$/.test(recorded)) fail("built-from", `${BUILT_FROM} is not a sha256 (run --build)`);
+  const head = committedDigest("HEAD");
+  if (recorded !== head) fail("built-from", "the .pio/ images were not built from HEAD's sources — run --build, commit, then --publish");
+  return `sources match HEAD (${head.slice(0, 12)})`;
+}
+
 /** The --check table. Never mutates anything. Returns true if every check passed. */
 function runCheckTable(): boolean {
   let version = "";
@@ -372,6 +436,7 @@ function runCheckTable(): boolean {
     probe("tag-remote", () => checkTagRemote(tag)),
     probe("origin-main", checkOriginMain),
     probe("manifest", () => checkManifest(version)),
+    probe("latest", () => checkNewerThanLatest(version)),
   ];
   printChecks(results);
   return results.every((r) => r.ok);
@@ -384,6 +449,9 @@ function stageDocs(version: string, a: Artefacts, dryRun: boolean): void {
   const shaLine = `${a.factorySha}  firmware.factory.bin\n`;
   if (dryRun) {
     // A dry run must leave the tracked tree untouched, so the docs/ writes are only described.
+    // The built-from record lives in the gitignored .pio/ and is written even here, so a
+    // dry run followed by a commit and --publish still has something true to check.
+    writeAtomically(BUILT_FROM, `${workingTreeDigest()}\n`);
     console.log(`DRY-RUN would: copy ${REL_FACTORY} -> docs/firmware.factory.bin`);
     console.log(plan.changed ? `DRY-RUN would: set docs/manifest.json version ${plan.from} -> ${version}` : `DRY-RUN would: leave docs/manifest.json (already ${version})`);
     console.log(`DRY-RUN would: write docs/firmware.factory.bin.sha256 = ${a.factorySha}`);
@@ -399,6 +467,8 @@ function stageDocs(version: string, a: Artefacts, dryRun: boolean): void {
   }
   writeAtomically(DOCS_SHA, shaLine);
   console.log(`wrote docs/firmware.factory.bin.sha256 = ${a.factorySha}`);
+  // Which sources this binary came from, so --publish can refuse a stale .pio/.
+  writeAtomically(BUILT_FROM, `${workingTreeDigest()}\n`);
 
   if (sha256(readFileSync(DOCS_FACTORY)) !== a.factorySha) fail("docs-factory", "docs/firmware.factory.bin does not match the build after copying");
   if (manifestVersion() !== version) fail("manifest", "docs/manifest.json does not carry FW_VERSION after writing");
@@ -470,6 +540,8 @@ function publishPreflight(version: string, builtThisRun: boolean): Preflight {
   ];
   const artefacts = verifiedArtefactsOrNull(version, results);
   results.push(probe("manifest", () => checkManifest(version)));
+  results.push(probe("latest", () => checkNewerThanLatest(version)));
+  results.push(probe("built-from", checkBuiltFromHead));
   let notes: string | null = null;
   if (artefacts) {
     results.push(
