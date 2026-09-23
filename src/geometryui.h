@@ -78,7 +78,10 @@ svg text{fill:var(--mut);font-size:15px;pointer-events:none}
 </fieldset>
 
 <fieldset id=rst><legend>Reset</legend>
-<div class=seg><button id=brst>Reset to standard wiring</button></div>
+<div class=seg><button id=brst>Standard wiring order</button><button id=bdef>Factory shape</button></div>
+<p class="note" style="border:0;padding:.5rem 0 0;margin:0"><b>Standard wiring order</b> keeps your digit count, LEDs per segment and decimal
+points and assigns LEDs in the order A,B,C,D,E,F,G,DP per digit. <b>Factory shape</b> goes all the way back to the four-digit,
+one-LED-per-segment panel this firmware ships for.</p>
 </fieldset>
 
 <p class=note id=note>Learn mode lights one LED group at a time and asks which segment it was, so you never have to know your own wiring. The picture fills in as you go.</p>
@@ -200,7 +203,10 @@ $('bback').onclick=()=>{if(step<1)return;step--;
 $('brst').onclick=()=>{let n=0,d,i,a=blank();
   for(d=0;d<G.digits;d++){for(i=0;i<7;i++)a[d][i]=n++*G.ledsPerSeg;
     if(G.dpMask&(1<<d))a[d][7]=n++*G.ledsPerSeg}
-  G.segBase=a;mode=0;tbl=null;paint();push('Standard wiring restored.')};
+  G.segBase=a;mode=0;tbl=null;paint();push('Standard wiring order applied to this shape.')};
+// The firmware's own reset: 4 digits, 1 LED per segment, decimal points on all four, packed.
+$('bdef').onclick=()=>{if(!confirm('Back to the factory shape: 4 digits, 1 LED per segment, all decimal points?'))return;
+  mode=0;tbl=null;post('/setgeometry?reset=1',j=>{if(j.ok===false){say('Rejected: '+(j.error||'unknown'),true);load()}else{G=j;G.segBase=G.segBase||[];say('Factory shape restored.');paint()}})};
 // Keep the latched preview alive while the page is open; only re-send an Identify
 // that was actually clicked.
 setInterval(()=>{if(!mode)return;
