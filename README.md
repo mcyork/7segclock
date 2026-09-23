@@ -170,6 +170,51 @@ factory image, which a running clock cannot install on itself.
 
 That asymmetry is not tidiness, it is the only arrangement that works.
 
+## Timezone and trust model
+
+This build shows **US Pacific time** (`TZ_STRING` in `src/main.cpp`, DST handled
+by the POSIX rule). A timezone setting on the settings page is planned for the
+next firmware; until then another zone means changing that one line and
+rebuilding.
+
+The settings page, the wiring editor, `/update`, the self-update trigger and
+ArduinoOTA have **no password**. Anyone on the same network can change settings
+or flash firmware. The setup access point uses a fixed, published password. Run
+the clock on a network you trust; hardening (POST-only routes, a request token,
+an OTA password) is on the list for the next firmware.
+
+## Repos
+
+| repo | what lives there |
+|---|---|
+| **mcyork/7segclock** (this one) | the firmware, the browser installer (`docs/`), and every release — **canonical** |
+| [mcyork/mini7seg](https://github.com/mcyork/mini7seg) | the `String7Segment` Arduino library, the enclosure and printed parts, and a byte-identical dev copy of this firmware at `firmware/ntp4digit/` for building against the library checkout |
+
+`src/` here and `mini7seg/firmware/ntp4digit/src/` are kept identical by hand;
+`diff -rq` them before committing either.
+
+## Release contract
+
+A clock in the field running any released firmware updates itself by asking
+`api.github.com/repos/mcyork/7segclock/releases/latest` for `tag_name` and then
+fetching `releases/latest/download/firmware.bin`. That code is already burned
+into devices, so every future release must keep all of this true:
+
+- this repo stays public under the same name;
+- the release is a normal release — not a draft, not a pre-release — and is
+  marked *Latest*;
+- the tag is `vX.Y.Z` (a leading `v` is stripped; three numeric parts);
+- an asset named exactly `firmware.bin` is attached, an **app image** (not the
+  factory image), at most `0x1E0000` bytes, built for the ESP32-C3;
+- the partition table stays `min_spiffs` — OTA cannot change it.
+
+`bun Release.ts --check` verifies the tree, `--build` builds and refreshes the
+installer image in `docs/`, `--publish` tags the built commit and creates the
+release. Nothing else should ever create a release by hand.
+
+Tag `v1.0.0` predates this contract and points at the initial commit, not at the
+commit its binary was built from; it is left alone rather than rewritten.
+
 ## Build
 
 ```
@@ -178,8 +223,10 @@ pio run -t upload                              # flash over USB
 pio run -t upload --upload-port mini7seg.local # OTA
 ```
 
-The segment library is [mcyork/mini7seg](https://github.com/mcyork/mini7seg),
-pulled in by `lib_deps`.
+Every dependency in `platformio.ini` is pinned to an exact version (platform,
+FastLED, and the segment library [mcyork/mini7seg](https://github.com/mcyork/mini7seg)
+at a specific commit) so a tagged commit rebuilds the same firmware. Do not loosen
+the pins; bump them deliberately.
 
 ## Licence
 

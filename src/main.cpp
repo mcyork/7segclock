@@ -1,8 +1,18 @@
 /*
- * ntp4digit — a four-digit NTP clock on an ESP32-C3 Super Mini.
+ * 7segclock (ntp4digit) — an NTP clock on WS2812 seven-segment digits, driven by
+ * an ESP32-C3 Super Mini.
  *
- * Deliberately much smaller than the ntp_clock project: no buttons, no buzzer,
- * no OTA, no web installer. Join wifi, get the time, show it.
+ * Joins wifi through a captive setup portal, gets the time by NTP, and serves a
+ * settings page plus a wiring editor at http://mini7seg.local/. Updates itself
+ * from GitHub Releases (Firmware > Check for updates), takes .bin uploads at
+ * /update, and accepts ArduinoOTA. New or unbootable boards are flashed from the
+ * browser installer at https://mcyork.github.io/7segclock/.
+ *
+ * REPOS. github.com/mcyork/7segclock is the canonical home of this firmware and
+ * the only place releases are cut. github.com/mcyork/mini7seg holds the segment
+ * library it depends on, the enclosure, and a synced copy of this source at
+ * firmware/ntp4digit/ for building against the library checkout. The two copies
+ * are kept byte-identical; edit one, copy to the other.
  *
  * WIRING  (three wires, all on one edge of the C3 Super Mini)
  *   5V   -> panel H1 V
@@ -36,10 +46,11 @@
  *   saved credentials in the background, and NTP failure is not a wifi problem
  *   so it never triggers the portal at all.
  *
- * BUILD  (the library lives two levels up; nothing puts it on the path for you)
- *   arduino-cli lib install FastLED
- *   arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc --library ../../src .
- *   arduino-cli upload  --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc -p /dev/cu.usbmodem* .
+ * BUILD  (PlatformIO; every dependency is pinned in platformio.ini)
+ *   pio run                                        # build
+ *   pio run -t upload                              # flash over USB
+ *   pio run -t upload --upload-port mini7seg.local # ArduinoOTA
+ *   bun Release.ts --check                         # release chain, see that file
  */
 
 #include <Arduino.h>
@@ -732,8 +743,9 @@ progress{width:100%;height:.5rem}a{color:#00a0ff}
 <form id=f method=POST action=/update enctype=multipart/form-data>
 <input type=file name=u accept=".bin" required><button>Upload &amp; restart</button></form>
 <progress id=p value=0 max=100 hidden></progress><p id=s class=n></p>
-<p class=n>Use <b>firmware.bin</b> from .pio/build/c3supermini/ &mdash; not
-firmware.factory.bin, which includes the bootloader and is for first flash over USB.</p>
+<p class=n>Use <b>firmware.bin</b> from a GitHub release of mcyork/7segclock, or from
+.pio/build/c3supermini/ if you built it yourself &mdash; not firmware.factory.bin,
+which includes the bootloader and is for first flash over USB.</p>
 <p class=n><a href="/">&larr; back to settings</a></p></div>
 <script>
 const f=document.getElementById('f'),p=document.getElementById('p'),s=document.getElementById('s');
@@ -777,7 +789,8 @@ inline bool isNewer(const String& a, const String& b) {
 }
 
 /** Ask GitHub for the newest release tag. Keyless: public repos allow 60
- *  unauthenticated calls an hour per IP, and this runs at most daily. */
+ *  unauthenticated calls an hour per IP, and this runs only when someone presses
+ *  Check for updates — there is no automatic check. */
 bool checkUpdate() {
   String b = httpGet(GH_LATEST, true);
   int k = b.indexOf("\"tag_name\":\"");
@@ -906,8 +919,8 @@ void startWeb() {
 //
 // ⚠ MDNS.begin() twice without an end() between hangs the mDNS task. It is
 // reachable from three places here (boot, leaving the portal, and the portal's
-// own retry), so the guard is not optional — it froze the clock coming home
-// from MakerNexus.
+// own retry), so the guard is not optional — it froze the clock the first time
+// it came home to a different network.
 bool mdnsUp = false;
 void startOta() {
   ArduinoOTA.setHostname(HOSTNAME);
@@ -1039,8 +1052,8 @@ void setup() {
   //
   // There was one, at 500 mA, carrying a comment about 32 x 60 mA = 1.9 A. Both
   // numbers were inherited from somewhere else: 60 mA is the 5050 WS2812B
-  // figure and this panel is WS2812B-2020 (DESIGN.md:9), and Ian's recollection
-  // is that the 500 came from the DEV BOARD, where the LEDs ran off 3.3 V -- a
+  // figure and this panel is built from WS2812B-2020 parts, and the 500 is
+  // remembered as a DEV BOARD number, where the LEDs ran off 3.3 V -- a
   // REGULATOR budget, not a USB one. Two unrelated limits conflated into a
   // ceiling that then throttled white content to brightness 93/255.
   //
@@ -1134,8 +1147,9 @@ void loop() {
   ArduinoOTA.handle();
   if (!timeValid) { syncTime(); return; }
 
-  // The background SNTP poller only refreshes hourly and the C3's RTC free-runs
-  // on an uncalibrated oscillator, so pin it down periodically.
+  // The background SNTP poller refreshes every 3 h (CONFIG_LWIP_SNTP_UPDATE_DELAY
+  // in the prebuilt core) and the C3's RTC free-runs on an uncalibrated
+  // oscillator, so pin it down periodically.
   if (millis() - lastSyncMs > RESYNC_AFTER_MS) syncTime();
 
   // Ticker: fetch on its own cache timer, scroll on the interval you set.

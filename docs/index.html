@@ -43,6 +43,13 @@ ESP32-C3 Super Mini. Flash it from this page — no toolchain, no drivers.</p>
   <li>Enter your wifi. It restarts, finds the time, and is then at
       <code>mini7seg.local</code>.</li>
 </ol>
+<p><b>Timezone:</b> this build shows US Pacific time (America/Los_Angeles, DST
+handled). A timezone setting on the settings page is planned for the next
+firmware; until then, other zones need a rebuild with <code>TZ_STRING</code>
+changed in <code>src/main.cpp</code>.</p>
+<p><b>Trust model:</b> the settings page, firmware upload and update endpoints
+have no password &mdash; anyone on your network can use them. Run it on a
+network you trust.</p>
 
 <h2>Wiring</h2>
 <p>Three wires from the C3, all on one edge of the board:</p>
@@ -65,5 +72,7 @@ that will not boot.</p>
 <p style="margin-top:3rem"><a href="https://github.com/mcyork/7segclock">Source on GitHub</a></p>
 </div>
 
-<script type="module"
-  src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<!-- ESP Web Tools 10.4.0, vendored (Apache-2.0, licence alongside). Self-hosted
+     so the installer never depends on a CDN or a floating version: what this page
+     runs is what was reviewed, and it keeps working if unpkg does not. -->
+<script type="module" src="vendor/esp-web-tools-10.4.0/install-button.js"></script>
