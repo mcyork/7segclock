@@ -8,11 +8,11 @@
  * /update, and accepts ArduinoOTA. New or unbootable boards are flashed from the
  * browser installer at https://mcyork.github.io/7segclock/.
  *
- * REPOS. github.com/mcyork/7segclock is the canonical home of this firmware and
- * the only place releases are cut. github.com/mcyork/mini7seg holds the segment
- * library it depends on, the enclosure, and a synced copy of this source at
- * firmware/ntp4digit/ for building against the library checkout. The two copies
- * are kept byte-identical; edit one, copy to the other.
+ * REPOS. github.com/mcyork/7segclock is the only home of this firmware and the
+ * only place releases are cut. github.com/mcyork/mini7seg holds the segment
+ * library it depends on and the enclosure. To work on both at once, clone them
+ * side by side and build with `pio run -e dev`, which takes the library from
+ * ../mini7seg instead of the pinned git commit.
  *
  * WIRING  (three wires, all on one edge of the C3 Super Mini)
  *   5V   -> panel H1 V

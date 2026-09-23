@@ -216,10 +216,12 @@ previous image.
 | repo | what lives there |
 |---|---|
 | **mcyork/7segclock** (this one) | the firmware, the browser installer (`docs/`), and every release — **canonical** |
-| [mcyork/mini7seg](https://github.com/mcyork/mini7seg) | the `String7Segment` Arduino library, the enclosure and printed parts, and a byte-identical dev copy of this firmware at `firmware/ntp4digit/` for building against the library checkout |
+| [mcyork/mini7seg](https://github.com/mcyork/mini7seg) | the `String7Segment` Arduino library and the enclosure and printed parts |
 
-`src/` here and `mini7seg/firmware/ntp4digit/src/` are kept identical by hand;
-`diff -rq` them before committing either.
+To change the library and the firmware together, clone the two repos side by
+side and build with `pio run -e dev`: that environment takes the library from
+`../mini7seg` through a symlink instead of the pinned git commit. Releases are
+always built from `c3supermini`, never from `dev`.
 
 ## Release contract
 
