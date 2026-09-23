@@ -159,9 +159,14 @@ A clock already on your network updates itself: open `mini7seg.local`, press
 **Check for updates** under Firmware. It asks GitHub for the newest release tag
 and compares it to what it is running. **Install** then asks again, refuses
 unless the release is strictly newer, and downloads that exact tag's
-`firmware.bin` over verified TLS (1.2.0 and later; 1.0.0 and 1.1.0 devices pull
+`firmware.bin` over verified TLS (1.2.1 and later; 1.0.0 and 1.1.0 devices pull
 `releases/latest/download/firmware.bin` without checking, which is why the
 release contract below never changes).
+
+**If your clock runs 1.2.0:** its self-update cannot reach GitHub's asset CDN
+(the CDN's certificate chain ends at a root that firmware does not trust). Open
+`/update` and upload `firmware.bin` from the newest release by hand; every
+release from 1.2.1 on updates itself.
 
 The browser installer at [mcyork.github.io/7segclock](https://mcyork.github.io/7segclock/)
 is for a *new* device, or one that will not boot — those need a cable and a full
