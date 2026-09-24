@@ -110,7 +110,7 @@ uint8_t  lastStressTry = 0;
 #include "ticker.h"
 
 // ---------------------------------------------------------------- behaviour
-#define FW_VERSION   "1.2.1"
+#define FW_VERSION   "1.2.2"
 // Self-update from GitHub Releases. The device asks the API for the latest tag,
 // and — since 1.2.0 — downloads THAT tag's asset rather than whatever `latest`
 // resolves to at flash time, so the version it verified is the version it flashes.
@@ -128,6 +128,7 @@ uint8_t  lastStressTry = 0;
                                        // long to come back after a power cut; wrong credentials need the
                                        // portal sooner than a ten-minute wait, and the portal keeps retrying
 #define PORTAL_RETRY_MS      60000UL   // portal keeps trying saved creds
+#define PORTAL_TRY_MS        12000UL   // ...for this long each time, then goes quiet so the AP can be seen
 #define NTP_RETRY_MS         60000UL   // re-kick SNTP while the first sync is outstanding
 #define RESYNC_AFTER_MS      21600000UL // re-kick SNTP every 6 h
 #define IMAGE_CONFIRM_MS     60000UL   // a fresh OTA image must run this long to stay
@@ -152,6 +153,7 @@ bool ntpStarted = false;
 uint32_t lastConnectedMs = 0;
 uint32_t lastReconnectMs = 0;
 uint32_t lastPortalTryMs = 0;
+uint32_t portalTryUntilMs = 0;    // non-zero while a bounded STA attempt is running under the portal
 uint32_t lastNtpTryMs    = 0;
 uint32_t lastResyncMs    = 0;
 volatile uint32_t lastRealSyncMs = 0;   // stamped ONLY by the SNTP callback (tcpip task)
@@ -1355,6 +1357,14 @@ void startPortal() {
   // Drop mDNS before changing interface mode. Leaving it registered across an
   // AP_STA switch is the other half of the same hang.
   if (mdnsUp) { MDNS.end(); mdnsUp = false; }
+  // SILENCE THE STATION FIRST. The C3 has one radio. A station hunting for a
+  // network that is not there (wrong SSID, router down) scans every channel
+  // continuously, and while it does the soft AP barely beacons — found on the
+  // bench: portal "up" for minutes and invisible to a phone. So the station's
+  // auto-reconnect goes off and its attempt is cancelled; the portal retries it
+  // on its own schedule, in short bounded bursts (see loop()).
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false);     // stop the attempt; keep the radio on and the credentials
   WiFi.mode(WIFI_AP_STA);            // AP_STA, not AP: we keep retrying the
                                      // saved network while the portal is up.
   WiFi.softAP(apSsid, AP_PASSWORD);
@@ -1377,8 +1387,10 @@ void stopPortal() {
   portalUp = false;
   dns.stop();
   // The web server stays up — it is the settings page now, not the portal.
+  portalTryUntilMs = 0;
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);       // back to normal: the driver rides out short drops itself
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -1477,18 +1489,23 @@ void loop() {
       // AP down and come up as a normal clock.
       stopPortal();
       onOnline();
-    } else if (now - lastPortalTryMs > PORTAL_RETRY_MS) {
-      // Non-blocking: begin() and come back next pass. The old tryConnect()
-      // here froze the portal (DNS and HTTP) for 15 s of every 60 while the
-      // phone was trying to use it. A STA attempt can still bump the radio off
-      // the AP channel, so while a phone is attached the retry waits — but not
-      // forever: a parked phone must not pin the clock in the portal.
+    } else if (portalTryUntilMs && (int32_t)(now - portalTryUntilMs) > 0) {
+      // The burst is over and it did not land: stop scanning so the AP is
+      // visible again until the next burst.
+      portalTryUntilMs = 0;
+      WiFi.disconnect(false, false);
+      Serial.println("[WIFI] saved network not found; portal visible again");
+    } else if (!portalTryUntilMs && now - lastPortalTryMs > PORTAL_RETRY_MS) {
+      // A bounded, non-blocking attempt: begin(), give it PORTAL_TRY_MS, then
+      // go quiet (above). The AP is hard to see during those seconds, so while
+      // a phone is attached the attempt waits — but not forever: a parked phone
+      // must not pin the clock in the portal.
       static uint32_t lastForcedMs = 0;
       lastPortalTryMs = now;                       // stamped even with no creds, so hasCreds() is not polled every pass
       bool phoneAttached = WiFi.softAPgetStationNum() > 0;
       if (!phoneAttached || now - lastForcedMs > 5 * PORTAL_RETRY_MS) {
         lastForcedMs = now;
-        if (hasCreds()) beginSta();
+        if (hasCreds() && beginSta()) portalTryUntilMs = now + PORTAL_TRY_MS;
       }
     }
     paintFrame();                    // the time, if known, not "AP" forever
