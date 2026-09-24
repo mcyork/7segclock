@@ -110,7 +110,7 @@ uint8_t  lastStressTry = 0;
 #include "ticker.h"
 
 // ---------------------------------------------------------------- behaviour
-#define FW_VERSION   "1.2.6"
+#define FW_VERSION   "1.2.7"
 // Self-update from GitHub Releases. The device asks the API for the latest tag,
 // and — since 1.2.0 — downloads THAT tag's asset rather than whatever `latest`
 // resolves to at flash time, so the version it verified is the version it flashes.

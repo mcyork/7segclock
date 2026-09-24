@@ -112,7 +112,7 @@ input[type=text],input[type=password],select{flex:2;background:#151920;color:var
 <div class=row><label for=ssid>WiFi network</label><input type=text id=ssid maxlength=32 spellcheck=false autocapitalize=off autocorrect=off></div>
 <div class=row><label for=pass>Password</label><input type=password id=pass maxlength=63 placeholder="blank for an open network"></div>
 <div class=seg><button id=netsave>Save network and restart</button></div>
-<p class="note flat" id=netn>Changing networks restarts the clock. If it cannot join, it waits ten minutes and then raises its own <b>setup network</b> so you can try again.</p>
+<p class="note flat" id=netn>Changing networks restarts the clock. If it cannot join the new network, it raises its own <b>setup network</b> after about three minutes so you can try again. (A network that drops after working gets ten minutes to come back first.)</p>
 <div class=seg style="margin-top:.8rem"><button id=freset class=warn>Factory reset</button></div>
 </fieldset>
 
