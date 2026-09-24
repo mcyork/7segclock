@@ -184,6 +184,11 @@ function readFirmwareVersion(): string {
   if (values.length !== 1) fail("version", `expected exactly one #define FW_VERSION in src/main.cpp, found ${values.length}`);
   const version = values[0] ?? "";
   if (!/^\d+\.\d+\.\d+$/.test(version)) fail("version", `FW_VERSION "${version}" is not X.Y.Z`);
+  // The clock shows its version at boot, one digit per panel position with the dots
+  // on the decimal points. More than four digits cannot be shown on the four-digit
+  // panel, so a version like 1.10.10 is refused here rather than silently skipped.
+  const digits = version.replace(/\./g, "").length;
+  if (digits > 4) fail("version", `FW_VERSION "${version}" has ${digits} digits; the boot display fits 4`);
   return version;
 }
 

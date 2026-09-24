@@ -110,7 +110,7 @@ uint8_t  lastStressTry = 0;
 #include "ticker.h"
 
 // ---------------------------------------------------------------- behaviour
-#define FW_VERSION   "1.2.2"
+#define FW_VERSION   "1.2.3"
 // Self-update from GitHub Releases. The device asks the API for the latest tag,
 // and — since 1.2.0 — downloads THAT tag's asset rather than whatever `latest`
 // resolves to at flash time, so the version it verified is the version it flashes.
@@ -377,6 +377,27 @@ void showWord(const char* s) {
       renderDecimalPoint(leds, cfg, i, CRGB(cfg.r, cfg.g, cfg.b));   // "this character does not exist"
   }
   FastLED.show();
+}
+
+// The firmware version, "1.2.3" as digits with decimal points, for a moment at
+// boot. It is the cheapest proof that an update landed: the clock says what it
+// is running before it does anything else. Each '.' rides on the digit before
+// it, so N.N.N needs three digits; Release.ts refuses a version whose digits do
+// not fit a four-digit panel. On a smaller panel it is skipped, not truncated.
+bool showVersion() {
+  const char* v = FW_VERSION;
+  uint8_t digitsNeeded = 0;
+  for (const char* p = v; *p; p++) if (*p >= '0' && *p <= '9') digitsNeeded++;
+  if (digitsNeeded == 0 || digitsNeeded > cfg.digits) return false;
+  clearDisplay(leds, cfg);
+  CRGB c(cfg.r, cfg.g, cfg.b);
+  int8_t pos = -1;
+  for (const char* p = v; *p; p++) {
+    if (*p >= '0' && *p <= '9') renderChar(leds, cfg, ++pos, *p, c);
+    else if (*p == '.' && pos >= 0) renderDecimalPoint(leds, cfg, pos, c);
+  }
+  FastLED.show();
+  return true;
 }
 
 // Busy indicator for waits. A static word during a 15 s connect looks like a
@@ -1457,6 +1478,9 @@ void setup() {
   // will roll back if it is not confirmed; "undefined" means it is not.
   Serial.printf("[OTA] running image state: %s\n", otaStateName());
   bootPending = imagePending();
+  // Version first, before wifi: 1.5 s on a clock that then spends seconds joining
+  // the network costs nothing, and after an update it confirms which image booted.
+  if (showVersion()) { Serial.println("[BOOT] showing version " FW_VERSION); delay(1500); }
   showSpin(0);
 
   sntp_set_time_sync_notification_cb(onTimeSynced);
