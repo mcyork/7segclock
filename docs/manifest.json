@@ -1,6 +1,6 @@
 {
   "name": "7segclock",
-  "version": "1.2.3",
+  "version": "1.2.5",
   "home_assistant_domain": "",
   "funding_url": "",
   "new_install_prompt_erase": true,
