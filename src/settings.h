@@ -95,6 +95,9 @@ static constexpr uint8_t  CITY_NAME_MAX = 32;
 enum Hue    : uint8_t { HUE_FIXED = 0, HUE_CYCLE, HUE_CHRONO, HUE_COUNT };
 enum Env    : uint8_t { ENV_NONE  = 0, ENV_BREATHE, ENV_COUNT };
 enum Colon  : uint8_t { COLON_BLINK = 0, COLON_ON, COLON_OFF };
+// Automatic updates. NOTIFY checks GitHub once a day and flashes the rightmost
+// decimal point when a newer release exists; INSTALL also installs it overnight.
+enum UpdMode : uint8_t { UPD_OFF = 0, UPD_NOTIFY, UPD_INSTALL, UPD_COUNT };
 // Seconds overlay, decomposed the same way the colour modes were. "Comet" was
 // Sweep-with-a-tail and "Fill" was Sweep-with-an-accumulating-tail, and Ring
 // had a fill welded into it — three more modes that were really one axis wearing
@@ -115,6 +118,7 @@ struct Settings {
   uint8_t speed      = 6;      // 1..20, rate for cycling and breathing
   uint8_t tickMins   = 0;      // 0 = ticker off, else show the cards every N min
   uint8_t cards      = 0x03;   // bitmask: 1 = bitcoin, 2 = temperature
+  uint8_t upd        = UPD_NOTIFY;   // automatic updates: off | notify | install overnight
   float   lat        = 0, lon = 0;   // 0,0 = not located yet (and no clocks live there)
   uint8_t dataPin    = DEFAULT_DATA_PIN;   // see PIN_XLIST — changing needs a reboot
   uint8_t digits      = DEFAULT_DIGITS;
@@ -385,6 +389,7 @@ inline void loadSettings(Settings& s) {
   s.speed      = p.getUChar("speed", s.speed);
   s.tickMins   = p.getUChar("tick",  s.tickMins);
   s.cards      = p.getUChar("cards", s.cards);
+  s.upd        = p.getUChar("upd",   s.upd);    // absent on a pre-1.2.4 device -> NOTIFY
   s.lat        = p.getFloat("lat",   s.lat);
   s.lon        = p.getFloat("lon",   s.lon);
   s.dataPin    = p.getUChar("pin",   s.dataPin);
@@ -412,6 +417,7 @@ inline void loadSettings(Settings& s) {
   if (s.spread > 64) s.spread = 64;
   if (s.tickMins > 60) s.tickMins = 60;
   if (s.cards > 3) s.cards = 3;
+  if (s.upd >= UPD_COUNT) s.upd = UPD_NOTIFY;
   p.end();
 }
 
@@ -429,6 +435,7 @@ inline bool saveSettings(const Settings& s) {
          && p.putUChar("speed", s.speed)
          && p.putUChar("tick",  s.tickMins)
          && p.putUChar("cards", s.cards)
+         && p.putUChar("upd",   s.upd)
          && p.putUChar("digits", s.digits)
          && p.putUChar("lps", s.ledsPerSeg)
          && p.putUShort("dpmask", s.dpMask)

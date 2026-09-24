@@ -110,7 +110,7 @@ uint8_t  lastStressTry = 0;
 #include "ticker.h"
 
 // ---------------------------------------------------------------- behaviour
-#define FW_VERSION   "1.2.3"
+#define FW_VERSION   "1.2.4"
 // Self-update from GitHub Releases. The device asks the API for the latest tag,
 // and — since 1.2.0 — downloads THAT tag's asset rather than whatever `latest`
 // resolves to at flash time, so the version it verified is the version it flashes.
@@ -133,6 +133,10 @@ uint8_t  lastStressTry = 0;
 #define RESYNC_AFTER_MS      21600000UL // re-kick SNTP every 6 h
 #define IMAGE_CONFIRM_MS     60000UL   // a fresh OTA image must run this long to stay
 #define FRAME_MS             200       // display cadence; loop() itself runs much faster
+#define AUTOCHECK_FIRST_MS   60000UL   // first automatic update check, after the time is known
+#define AUTOCHECK_EVERY_MS   86400000UL // then once a day
+#define AUTOCHECK_RETRY_MS   3600000UL // a failed check is retried in an hour
+#define AUTOINSTALL_HOUR     3         // local hour when INSTALL mode installs
 
 #define SSID_MAX  32              // 802.11 limits; longer silently never associates
 #define PASS_MAX  63
@@ -160,6 +164,11 @@ volatile uint32_t lastRealSyncMs = 0;   // stamped ONLY by the SNTP callback (tc
 uint32_t lastPaintMs     = 0;
 uint8_t  spinStep        = 0;
 Settings cfg;
+// Update state, read by the display (flashing dot) and by the update routes.
+bool     updAvail = false;        // the last check found a strictly newer release
+uint32_t lastCheckMs = 0;         // when the last successful check ran
+uint32_t nextAutoCheckMs = 0;     // 0 until the clock first has the time
+int      lastInstallYday = -1;    // INSTALL mode tries once per night, not once per loop
 uint8_t  bootPin = DEFAULT_DATA_PIN;   // the pin FastLED was built on this boot
 char     hostName[DEV_NAME_MAX + 1];
 char     apSsid[DEV_NAME_MAX + 8];
@@ -465,6 +474,11 @@ void showTime() {
   // a clock that goes dark every time the router hiccups is useless.
   if (WiFi.status() != WL_CONNECTED && shown > 0)
     renderDecimalPoint(leds, cfg, shown - 1, colourFor(cfg, shown - 1, t, ms));
+  // Update available: the same dot FLASHES — 0.4 s in every second, clearly not
+  // the colon, which is on for a whole second at a time. Offline (steady) wins,
+  // since an offline clock cannot act on an update anyway.
+  else if (updAvail && cfg.upd != UPD_OFF && shown > 0 && (ms % 1000) < 400)
+    renderDecimalPoint(leds, cfg, shown - 1, colourFor(cfg, shown - 1, t, ms));
   FastLED.show();
 }
 
@@ -625,6 +639,9 @@ void sendState() {
   o += ",\"online\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
   o += ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"host\":\"" + String(hostName) + "\"";
   o += ",\"updErr\":\"" + jsonEscape(updErr) + "\",\"checkCode\":" + String(lastCheckCode);
+  o += ",\"upd\":" + String(cfg.upd) + ",\"updAvail\":" + String(updAvail ? "true" : "false");
+  o += ",\"updLatest\":\"" + jsonEscape(latestTag) + "\"";
+  o += ",\"updCheckMin\":" + (lastCheckMs ? String((millis() - lastCheckMs) / 60000UL) : String("null"));
   // Rollback state of the running image and the size of the slot the next update
   // lands in: the two facts a release test has to read off the device itself.
   const esp_partition_t* nextSlot = esp_ota_get_next_update_partition(NULL);
@@ -637,7 +654,7 @@ void handleSet() {
   if (!requireWrite()) return;
   static const char* const allowed[] = {
     "hue", "spread", "env", "secpath", "sectrail", "r", "g", "b", "bri",
-    "colon", "speed", "tick", "cards", "pin", "h12", "tz", "name"
+    "colon", "speed", "tick", "cards", "pin", "h12", "tz", "name", "upd"
   };
   if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
 
@@ -658,6 +675,7 @@ void handleSet() {
   if (!readOptionalU8("speed",  next.speed,      1, 20)) return;
   if (!readOptionalU8("tick",   next.tickMins,   0, 60)) return;
   if (!readOptionalU8("cards",  next.cards,      0, 3)) return;
+  if (!readOptionalU8("upd",    next.upd,        0, UPD_COUNT - 1)) return;
   // Validated against the allow-list, not just a range: an arbitrary pin would
   // fall through to the default and silently keep using 4, which looks like the
   // setting simply does not work.
@@ -1072,6 +1090,8 @@ bool checkUpdate() {
   if (!plainVersion(tag)) { Serial.printf("[UPD] refusing odd tag %s\n", raw.c_str()); lastCheckCode = 0; return false; }
   latestRawTag = raw;
   latestTag = tag;
+  updAvail = isNewer(latestTag, FW_VERSION);   // drives the flashing dot and INSTALL mode
+  lastCheckMs = millis();
   Serial.printf("[UPD] running %s, latest %s\n", FW_VERSION, latestTag.c_str());
   return true;
 }
@@ -1093,6 +1113,40 @@ void handleFactoryReset() {
   delay(100);
   confirmBeforeRestart();
   ESP.restart();
+}
+
+// Download and flash the release checkUpdate() last saw (latestRawTag). Shared by
+// the Install button and INSTALL mode. Reboots on success; on failure records
+// updErr for the page and holds "Err" on the panel.
+void performUpdate() {
+  showWord("UPd");
+  updErr = "";
+  // The asset URL is on github.com, whose chain the IDF bundle verifies, but it
+  // answers with a redirect to GitHub's asset CDN — and THAT host chains to a
+  // root the bundle in this core predates (Let's Encrypt "Root YR", found the
+  // hard way on the first 1.2.0 self-update test). So: resolve the redirect on
+  // the bundle client, then download with the bundle first and, if the CDN's
+  // chain is not in it, with the anchors in roots.h. Never setInsecure().
+  String asset = String(GH_DL) + latestRawTag + "/firmware.bin";  // the tag we just verified, not "latest"
+  String target = resolveRedirect(asset);
+  Serial.printf("[UPD] asset %s\n[UPD] -> %s\n", asset.c_str(), target.c_str());
+  t_httpUpdate_return r = HTTP_UPDATE_FAILED;
+  for (uint8_t attempt = 0; attempt < 2 && r != HTTP_UPDATE_OK; attempt++) {
+    WiFiClientSecure tls;
+    if (attempt == 0) trustRootBundle(tls); else tls.setCACert(EXTRA_ROOTS_PEM);
+    httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    httpUpdate.rebootOnUpdate(true);
+    r = httpUpdate.update(tls, target);
+    if (r != HTTP_UPDATE_OK) {
+      if (updErr.length()) updErr += "; ";
+      updErr += String(attempt == 0 ? "bundle: " : "roots.h: ") + httpUpdate.getLastError() + " " + httpUpdate.getLastErrorString();
+    }
+  }
+  if (r != HTTP_UPDATE_OK) {
+    updErr = String(latestTag) + " " + updErr;
+    Serial.printf("[UPD] failed %s\n", updErr.c_str());
+    holdWord("Err");
+  }
 }
 
 void startWeb() {
@@ -1198,34 +1252,7 @@ void startWeb() {
     // otherwise time out, leaving the page unable to say whether it worked.
     server.send(200, "application/json", "{\"ok\":true,\"started\":true,\"target\":\"" + jsonEscape(latestTag) + "\"}");
     server.client().stop();
-    showWord("UPd");
-    updErr = "";
-    // The asset URL is on github.com, whose chain the IDF bundle verifies, but it
-    // answers with a redirect to GitHub's asset CDN — and THAT host chains to a
-    // root the bundle in this core predates (Let's Encrypt "Root YR", found the
-    // hard way on the first 1.2.0 self-update test). So: resolve the redirect on
-    // the bundle client, then download with the bundle first and, if the CDN's
-    // chain is not in it, with the anchors in roots.h. Never setInsecure().
-    String asset = String(GH_DL) + latestRawTag + "/firmware.bin";  // the tag we just verified, not "latest"
-    String target = resolveRedirect(asset);
-    Serial.printf("[UPD] asset %s\n[UPD] -> %s\n", asset.c_str(), target.c_str());
-    t_httpUpdate_return r = HTTP_UPDATE_FAILED;
-    for (uint8_t attempt = 0; attempt < 2 && r != HTTP_UPDATE_OK; attempt++) {
-      WiFiClientSecure tls;
-      if (attempt == 0) trustRootBundle(tls); else tls.setCACert(EXTRA_ROOTS_PEM);
-      httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-      httpUpdate.rebootOnUpdate(true);
-      r = httpUpdate.update(tls, target);
-      if (r != HTTP_UPDATE_OK) {
-        if (updErr.length()) updErr += "; ";
-        updErr += String(attempt == 0 ? "bundle: " : "roots.h: ") + httpUpdate.getLastError() + " " + httpUpdate.getLastErrorString();
-      }
-    }
-    if (r != HTTP_UPDATE_OK) {
-      updErr = String(latestTag) + " " + updErr;
-      Serial.printf("[UPD] failed %s\n", updErr.c_str());
-      holdWord("Err");
-    }
+    performUpdate();
   });
   // Two handlers: the second streams the file, the first replies once it is in.
   server.on("/update", HTTP_POST,
@@ -1580,6 +1607,34 @@ void loop() {
   // oscillator, so re-kick it every 6 h as well. Whether a reply arrives is
   // recorded by the callback, and /api reports minutes since the last real sync.
   if (now - lastResyncMs > RESYNC_AFTER_MS) { lastResyncMs = now; startNtp(); }
+
+  // Automatic update check: a minute after the clock first has the time, then
+  // once a day. A few seconds of spread from the MAC keep a houseful of clocks
+  // that powered up together from asking GitHub in the same second. The check is
+  // one small TLS request; the flashing dot and INSTALL mode both read updAvail.
+  if (cfg.upd != UPD_OFF && !wiringOwnsPanel()) {
+    if (!nextAutoCheckMs) {
+      nextAutoCheckMs = now + AUTOCHECK_FIRST_MS + (uint32_t)(ESP.getEfuseMac() % 30000ULL);
+    } else if ((int32_t)(now - nextAutoCheckMs) >= 0) {
+      bool ok = checkUpdate();
+      nextAutoCheckMs = now + (ok ? AUTOCHECK_EVERY_MS : AUTOCHECK_RETRY_MS);
+      Serial.printf("[UPD] auto-check: %s\n",
+                    !ok ? "failed, retry in 1 h" : updAvail ? ("update available: " + latestTag).c_str() : "up to date");
+    }
+  }
+  // INSTALL mode: once, in the small hours, if the last check found something.
+  // Re-checked immediately before installing, so a release pulled in the
+  // meantime is never installed.
+  if (cfg.upd == UPD_INSTALL && updAvail && !wiringOwnsPanel()) {
+    struct tm lt;
+    if (getLocalTime(&lt, 0) && lt.tm_hour == AUTOINSTALL_HOUR && lt.tm_yday != lastInstallYday) {
+      lastInstallYday = lt.tm_yday;
+      if (checkUpdate() && updAvail) {
+        Serial.printf("[UPD] installing %s overnight\n", latestTag.c_str());
+        performUpdate();             // reboots on success
+      }
+    }
+  }
 
   // Ticker: fetch on its own cache timer, scroll on the interval you set.
   // Guarded on timeValid so a clock that does not yet know the time never

@@ -118,6 +118,9 @@ input[type=text],input[type=password],select{flex:2;background:#151920;color:var
 
 <fieldset><legend>Firmware</legend>
 <div class=row><label>Version</label><output id=fwv></output></div>
+<div class=row><label id=updl>Automatic updates</label><div class=seg id=upd aria-labelledby=updl>
+<button data-v=0>Off</button><button data-v=1>Notify</button><button data-v=2>Install</button></div></div>
+<p class="note flat" id=updn></p>
 <div class=seg><button id=chk>Check for updates</button></div>
 <p class="note flat" id=fwn></p>
 <p class="note flat" id=upderr></p>
@@ -173,6 +176,13 @@ function paint(d){S=d;
      d.tempF!=null?(d.tempF.toFixed(1)+'\u00b0F'+(d.city?' in '+d.city:'')):'temp not fetched'].join('  \u00b7  ');
   stat(d);
   $('fwv').textContent=d.fw;
+  [...$('upd').children].forEach(b=>b.setAttribute('aria-pressed',+b.dataset.v===d.upd));
+  const when=d.updCheckMin==null?'not checked yet':('checked '+(d.updCheckMin<1?'just now':d.updCheckMin<120?d.updCheckMin+' min ago':Math.round(d.updCheckMin/60)+' h ago'));
+  $('updn').innerHTML=({0:'Never checks by itself. Use the button below.',
+    1:'Checks GitHub once a day. When a newer release exists, the rightmost decimal point <b>flashes</b> until you install it.',
+    2:'Checks once a day and installs a newer release by itself around 3 a.m. The dot flashes while one is waiting.'}[d.upd]||'')+
+    (d.upd?' ('+when+'.)':'')+
+    (d.updAvail?'<br><b>Version '+d.updLatest+' is available.</b> Press Check for updates to install it now.':'');
   $('title').textContent=(d.name||'mini7seg')+' clock';
   // Timezone: the select shows a known zone or "Custom"; the text field always holds the rule.
   const tz=tzAlias(d.tz||'');const known=TZ.some(t=>t[1]===tz);
@@ -242,6 +252,7 @@ $('freset').onclick=()=>{if(!confirm('Forget the WiFi network, the wiring map an
   $('netn').textContent='Resetting...';
   fetch('/factoryreset',H).then(r=>r.json()).then(j=>{$('netn').textContent=j.ok?'Reset. The clock restarts and raises its setup network.':'Not reset: '+(j.error||'unknown')})
   .catch(()=>{$('netn').textContent='Reset sent; the clock is restarting.'})};
+$('upd').onclick=e=>{if(e.target.dataset.v!==undefined)send({upd:+e.target.dataset.v})};
 $('chk').onclick=()=>{const n=$('fwn');n.textContent='Checking...';
   fetch('/checkupdate',H).then(r=>r.json()).then(u=>{
     if(!u.ok){n.textContent=u.code==404?'No release has been published yet.':
