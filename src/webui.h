@@ -121,6 +121,7 @@ input[type=text],input[type=password],select{flex:2;background:#151920;color:var
 <div class=row><label id=updl>Automatic updates</label><div class=seg id=upd aria-labelledby=updl>
 <button data-v=0>Off</button><button data-v=1>Notify</button><button data-v=2>Install</button></div></div>
 <p class="note flat" id=updn></p>
+<div id=updnow></div>
 <div class=seg><button id=chk>Check for updates</button></div>
 <p class="note flat" id=fwn></p>
 <p class="note flat" id=upderr></p>
@@ -182,7 +183,13 @@ function paint(d){S=d;
     1:'Checks GitHub once a day. When a newer release exists, the rightmost decimal point <b>flashes</b> until you install it.',
     2:'Checks once a day and installs a newer release by itself around 3 a.m. The dot flashes while one is waiting.'}[d.upd]||'')+
     (d.upd?' ('+when+'.)':'')+
-    (d.updAvail?'<br><b>Version '+d.updLatest+' is available.</b> Press Check for updates to install it now.':'');
+    (d.updAvail?'<br><b>Version '+d.updLatest+' is available.</b>':'');
+  // The action sits next to the news: an update the clock already found is one
+  // press away, not "go and press Check first". Part of the painted state, so it
+  // appears and disappears with updAvail.
+  const un=$('updnow');un.innerHTML='';
+  if(d.updAvail&&d.updLatest){const b=document.createElement('button');b.className='act';
+    b.textContent='Install '+d.updLatest+' now';b.onclick=()=>installNow(d.updLatest,$('fwn'));un.appendChild(b)}
   $('title').textContent=(d.name||'mini7seg')+' clock';
   // Timezone: the select shows a known zone or "Custom"; the text field always holds the rule.
   const tz=tzAlias(d.tz||'');const known=TZ.some(t=>t[1]===tz);
@@ -259,13 +266,11 @@ $('chk').onclick=()=>{const n=$('fwn');n.textContent='Checking...';
       u.code==403?'GitHub rate limit reached (60 checks an hour per address). Try again later.':
       u.code?'GitHub answered HTTP '+u.code+'.':'Could not reach GitHub.';return}
     if(!u.newer){n.textContent='Up to date ('+u.current+'; latest release '+u.latest+').';return}
-    n.textContent='Version '+u.latest+' available. ';
-    const b=document.createElement('button');b.textContent='Install now';
-    b.style.cssText='width:auto;padding:.4rem .8rem;margin-left:.4rem';
-    b.onclick=()=>{n.textContent='Downloading and installing '+u.latest+' - about 30 s. The clock restarts on its own; do not power it off.';
-      fetch('/doupdate',H).then(r=>r.json()).then(j=>{if(j.ok===false)n.textContent='Refused: '+(j.error||'unknown');else watchUpdate(u.latest)})
-      .catch(()=>watchUpdate(u.latest))};
-    n.appendChild(b)}).catch(()=>{n.textContent='Could not reach the clock.'})};
+    n.textContent='';reload()}).catch(()=>{n.textContent='Could not reach the clock.'})};   // repaint: the Install button comes from updAvail
+function installNow(v,n){$('updnow').innerHTML='';
+  n.textContent='Downloading and installing '+v+' - about 30 s. The clock restarts on its own; do not power it off.';
+  fetch('/doupdate',H).then(r=>r.json()).then(j=>{if(j.ok===false)n.textContent='Refused: '+(j.error||'unknown');else watchUpdate(v)})
+  .catch(()=>watchUpdate(v))}
 // After Install: poll until the new version answers, or the firmware reports why it did not.
 function watchUpdate(target){let tries=0;const t=setInterval(()=>{tries++;
   fetch('/api').then(r=>r.json()).then(d=>{
