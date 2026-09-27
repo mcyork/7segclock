@@ -110,7 +110,7 @@ uint8_t  lastStressTry = 0;
 #include "ticker.h"
 
 // ---------------------------------------------------------------- behaviour
-#define FW_VERSION   "1.2.7"
+#define FW_VERSION   "1.3.0"
 // Self-update from GitHub Releases. The device asks the API for the latest tag,
 // and — since 1.2.0 — downloads THAT tag's asset rather than whatever `latest`
 // resolves to at flash time, so the version it verified is the version it flashes.
@@ -314,6 +314,79 @@ static constexpr uint32_t PREVIEW_IDLE_MS = 300000UL;
 // repainted over the preview five times a second.
 inline bool wiringOwnsPanel() { return previewMode != PREVIEW_OFF; }
 
+// ---------------------------------------------------------------- countdown
+// A print timer that takes the panel over from the clock. It runs on millis(),
+// so it needs neither the network nor the time of day — it works from the setup
+// portal at a makerspace whose WiFi the clock has never seen. When the clock
+// DOES know the time, the end is also stored as wall-clock time, so a power blip
+// halfway through a six-hour print resumes the countdown instead of losing it.
+static constexpr uint32_t TIMER_MAX_S   = 999UL * 60 + 59;   // what "MMM.T" can show on four digits
+static constexpr uint32_t TIMER_DONE_MS = 3600000UL;         // "donE" flashes this long, then the clock returns
+bool     timerOn     = false;
+uint32_t timerEndMs  = 0;
+uint32_t timerDoneMs = 0;         // non-zero once it has reached zero
+bool     timerSaved  = false;     // the wall-clock end is in NVS
+
+uint32_t timerLeftS() {
+  int32_t left = (int32_t)(timerEndMs - millis());
+  return left > 0 ? ((uint32_t)left + 999) / 1000 : 0;   // round up: "0" only when it is really over
+}
+
+void timerForget() {
+  Preferences p;
+  if (p.begin("timer", false)) { p.clear(); p.end(); }
+  timerSaved = false;
+}
+
+// Called at start and again once the time is first known, so a countdown begun
+// from the portal becomes restorable as soon as the clock gets online.
+void timerPersist() {
+  if (!timerOn || timerDoneMs || timerSaved || !timeValid) return;
+  time_t now = time(nullptr);
+  if (now < 1700000000) return;      // not a real date yet
+  Preferences p;
+  if (p.begin("timer", false)) {
+    timerSaved = p.putLong64("end", (int64_t)now + timerLeftS()) > 0;
+    p.end();
+  }
+}
+
+void timerStart(uint32_t secs) {
+  timerForget();
+  if (secs == 0) { timerOn = false; timerDoneMs = 0; Serial.println("[TIMER] cancelled"); return; }
+  timerOn = true;
+  timerDoneMs = 0;
+  timerEndMs = millis() + secs * 1000UL;
+  Serial.printf("[TIMER] %lu s\n", (unsigned long)secs);
+  timerPersist();
+}
+
+String timerJson() {
+  String o = ",\"timerLeft\":" + (timerOn && !timerDoneMs ? String(timerLeftS()) : String("null"));
+  o += ",\"timerDone\":" + String(timerOn && timerDoneMs ? "true" : "false");
+  return o;
+}
+
+// Once, when the time first becomes valid after boot.
+void timerRestore() {
+  static bool done = false;
+  if (done || !timeValid) return;
+  done = true;
+  if (timerOn) { timerPersist(); return; }
+  Preferences p;
+  if (!p.begin("timer", true)) return;
+  int64_t end = p.getLong64("end", 0);
+  p.end();
+  if (!end) return;
+  int64_t left = end - (int64_t)time(nullptr);
+  if (left <= 0 || left > (int64_t)TIMER_MAX_S) { timerForget(); return; }
+  timerOn = true;
+  timerDoneMs = 0;
+  timerEndMs = millis() + (uint32_t)left * 1000UL;
+  timerSaved = true;
+  Serial.printf("[TIMER] restored after restart: %ld s left\n", (long)left);
+}
+
 // ---------------------------------------------------------------- display
 void renderDigit(uint8_t pos, uint8_t segmentMask, CRGB colour) {
   renderSegments(leds, cfg, pos, segmentMask, colour);
@@ -482,6 +555,64 @@ void showTime() {
   FastLED.show();
 }
 
+// The countdown face, right-aligned on however many digits the panel has.
+//   four digits, 100 min or more   MMM.T   minutes, then tens of seconds: "145.3"
+//   four digits, under 100 min     MM.SS   " 55.20"-style, minutes unpadded
+//   six digits,  an hour or more   H.MM.SS
+//   the last minute                  SS     bare seconds, counting down in red
+//   done                           donE   flashing, until cancelled or an hour passes
+void showTimer() {
+  if (wiringOwnsPanel()) return;
+  uint32_t ms = millis();
+  const uint8_t W = min<uint8_t>(cfg.digits, 8);
+  struct tm t = {};
+  if (timeValid) getLocalTime(&t, 0);
+  clearDisplay(leds, cfg);
+
+  uint32_t s = timerLeftS();
+  if (s == 0 && !timerDoneMs) {
+    timerDoneMs = ms | 1;
+    timerForget();                   // a finished timer must not come back after a restart
+    Serial.println("[TIMER] done");
+  }
+  if (timerDoneMs) {
+    if (ms - timerDoneMs > TIMER_DONE_MS) { timerOn = false; timerDoneMs = 0; return; }
+    if ((ms - timerDoneMs) % 1000 < 600) {
+      const char* w = W >= 4 ? "donE" : "0";
+      uint8_t len = strlen(w), off = W > len ? W - len : 0;
+      for (uint8_t i = 0; i < len && off + i < W; i++) renderChar(leds, cfg, off + i, w[i], CRGB::Red);
+    }
+    FastLED.show();
+    return;
+  }
+
+  uint32_t m = s / 60, sec = s % 60;
+  char core[12];
+  int8_t dpA = -1, dpB = -1;          // decimal points, as indexes into core
+  if (W >= 6 && s >= 3600) {
+    snprintf(core, sizeof core, "%lu%02lu%02lu", (unsigned long)(s / 3600), (unsigned long)(m % 60), (unsigned long)sec);
+    dpA = strlen(core) - 5; dpB = strlen(core) - 3;
+  } else if (W >= 4 && m >= 100) {
+    snprintf(core, sizeof core, "%lu%lu", (unsigned long)m, (unsigned long)(sec / 10));
+    dpA = strlen(core) - 2;
+  } else if (W >= 4 && m >= 1) {
+    snprintf(core, sizeof core, "%lu%02lu", (unsigned long)m, (unsigned long)sec);
+    dpA = strlen(core) - 3;
+  } else if (m >= 1) {
+    snprintf(core, sizeof core, "%lu", (unsigned long)((s + 59) / 60));   // tiny panel: minutes, rounded up
+  } else {
+    snprintf(core, sizeof core, "%lu", (unsigned long)sec);
+  }
+  uint8_t len = strlen(core), skip = len > W ? len - W : 0, off = W > len ? W - len : 0;
+  for (uint8_t i = skip; i < len; i++) {
+    uint8_t pos = off + i - skip;
+    CRGB c = m == 0 ? CRGB(CRGB::Red) : colourFor(cfg, pos, t, ms);
+    renderDigit(pos, String7Segment::getPattern(core[i]), c);
+    if (i == dpA || i == dpB) renderDecimalPoint(leds, cfg, pos, c);
+  }
+  FastLED.show();
+}
+
 // A word that must be SEEN — "Err" after a failed update — would otherwise be
 // repainted over by the next frame 200 ms later. Hold the frame painter off.
 uint32_t holdUntilMs = 0;
@@ -498,7 +629,10 @@ void paintFrame() {
   if (holdUntilMs && (int32_t)(holdUntilMs - now) > 0) return;
   holdUntilMs = 0;
   lastPaintMs = now;
-  if (timeValid) showTime();
+  // The countdown outranks everything but the wiring wizard: it runs with or
+  // without the network, so it also outranks "AP" and the connecting spinner.
+  if (timerOn && !wiringOwnsPanel()) showTimer();
+  else if (timeValid) showTime();
   else if (wiringOwnsPanel()) return;
   else if (portalUp) showWord("AP");   // the one hint to go and find the setup network
   else { showSpin(spinStep); spinStep = (spinStep + 1) % 6; }
@@ -559,6 +693,76 @@ void confirmImage() {
 }
 
 // ---------------------------------------------------------------- credentials
+// SEVERAL NETWORKS, ONE CLOCK  (1.3.0)
+//   A clock that travels between home and a makerspace used to know exactly one
+//   network, so every trip ended in the setup portal. It now keeps up to NET_MAX,
+//   newest first, and joins the STRONGEST saved one a scan can see.
+//   Slot 0 keeps the historic keys "ssid"/"pass" and the list is always compact,
+//   so hasCreds() is unchanged and a rollback to 1.2.x still finds a network —
+//   the most recently added one.
+static constexpr uint8_t NET_MAX = 5;
+
+String netKey(const char* stem, uint8_t i) { return i ? String(stem) + i : String(stem); }
+
+uint8_t readNets(String ssid[NET_MAX], String pass[NET_MAX]) {
+  uint8_t n = 0;
+  if (!prefs.begin("wifi", true)) return 0;
+  for (uint8_t i = 0; i < NET_MAX; i++) {
+    String k = netKey("ssid", i);
+    if (!prefs.isKey(k.c_str())) break;   // compact by construction: the first gap is the end
+    String s = prefs.getString(k.c_str(), "");   // (isKey first: a missing key logs an error)
+    if (s.isEmpty()) break;
+    ssid[n] = s;
+    String pk = netKey("pass", i);
+    pass[n] = prefs.isKey(pk.c_str()) ? prefs.getString(pk.c_str(), "") : String();
+    n++;
+  }
+  prefs.end();
+  return n;
+}
+
+bool writeNets(const String ssid[NET_MAX], const String pass[NET_MAX], uint8_t n) {
+  if (!prefs.begin("wifi", false)) return false;
+  bool ok = true;
+  for (uint8_t i = 0; i < NET_MAX; i++) {
+    String sk = netKey("ssid", i), pk = netKey("pass", i);
+    if (i < n) {
+      ok = ok && prefs.putString(sk.c_str(), ssid[i]) > 0;
+      // An empty password means an open network; a stale one left behind would
+      // make that network unjoinable forever.
+      if (pass[i].isEmpty()) prefs.remove(pk.c_str());
+      else ok = ok && prefs.putString(pk.c_str(), pass[i]) > 0;
+    } else {
+      prefs.remove(sk.c_str());
+      prefs.remove(pk.c_str());
+    }
+  }
+  prefs.end();
+  return ok;
+}
+
+/** Add or update a network and move it to the front. The oldest falls off a full list. */
+bool addNet(const String& ssid, const String& pass) {
+  String s[NET_MAX], p[NET_MAX], ns[NET_MAX], np[NET_MAX];
+  uint8_t n = readNets(s, p), m = 0;
+  ns[m] = ssid; np[m] = pass; m++;
+  for (uint8_t i = 0; i < n && m < NET_MAX; i++)
+    if (s[i] != ssid) { ns[m] = s[i]; np[m] = p[i]; m++; }
+  return writeNets(ns, np, m);
+}
+
+/** Returns false if it was not saved, or the flash write failed. */
+bool forgetNet(const String& ssid, bool& found) {
+  String s[NET_MAX], p[NET_MAX], ns[NET_MAX], np[NET_MAX];
+  uint8_t n = readNets(s, p), m = 0;
+  found = false;
+  for (uint8_t i = 0; i < n; i++) {
+    if (s[i] == ssid) { found = true; continue; }
+    ns[m] = s[i]; np[m] = p[i]; m++;
+  }
+  return found ? writeNets(ns, np, m) : true;
+}
+
 bool hasCreds() {
   prefs.begin("wifi", true);
   bool have = prefs.getString("ssid", "").length() > 0;
@@ -578,12 +782,20 @@ button{background:#111;color:#fff;border:0;border-radius:.3rem}#m{color:#b00;fon
 <input id=s name=ssid placeholder='WiFi network' maxlength=32 required autocapitalize=off autocorrect=off spellcheck=false>
 <input id=p name=pass type=password placeholder='Password (blank for an open network)' maxlength=63>
 <button>Save and restart</button></form><p id=m></p>
+<h3>Countdown</h3><p style="font-size:.9rem;margin:.2rem 0">No WiFi needed. The display counts down instead of showing the time.</p>
+<input id=tm type=number min=1 max=999 inputmode=numeric placeholder=Minutes>
+<button type=button id=tg>Start countdown</button><button type=button id=tc style="background:#555">Cancel countdown</button><p id=tn></p>
 <script>
 document.getElementById('f').onsubmit=e=>{e.preventDefault();const m=document.getElementById('m');m.textContent='Saving...';
 fetch('/save?'+new URLSearchParams({ssid:document.getElementById('s').value,pass:document.getElementById('p').value}),
  {method:'POST',headers:{'X-7seg':'1'}}).then(r=>r.json()).then(j=>{m.style.color=j.ok?'#080':'#b00';
  m.textContent=j.ok?'Saved. Restarting - join your network and open %NAME%.local':('Not saved: '+(j.error||'unknown'))})
  .catch(()=>{m.textContent='The clock did not answer. Try again.'})};
+const tn=document.getElementById('tn'),ts=q=>fetch('/timer?'+new URLSearchParams(q),{method:'POST',headers:{'X-7seg':'1'}})
+ .then(r=>r.json()).then(j=>{tn.textContent=j.ok?(j.timerLeft?'Running: '+Math.round(j.timerLeft/60)+' min.':'Cancelled.'):('Not started: '+(j.error||'unknown'))})
+ .catch(()=>{tn.textContent='The clock did not answer.'});
+document.getElementById('tg').onclick=()=>{const v=+document.getElementById('tm').value;if(v>0)ts({sec:v*60});else tn.textContent='Enter minutes first.'};
+document.getElementById('tc').onclick=()=>ts({sec:0});
 </script>)HTML";
 
 void handleRoot() {
@@ -646,6 +858,14 @@ void sendState() {
   // lands in: the two facts a release test has to read off the device itself.
   const esp_partition_t* nextSlot = esp_ota_get_next_update_partition(NULL);
   o += ",\"otaState\":\"" + String(otaStateName()) + "\",\"otaSlot\":" + String(nextSlot ? nextSlot->size : 0);
+  o += timerJson();
+  {
+    String ss[NET_MAX], pp[NET_MAX];
+    uint8_t k = readNets(ss, pp);
+    o += ",\"ssid\":\"" + (WiFi.status() == WL_CONNECTED ? jsonEscape(WiFi.SSID()) : String("")) + "\",\"nets\":[";
+    for (uint8_t i = 0; i < k; i++) { if (i) o += ","; o += "\"" + jsonEscape(ss[i]) + "\""; }
+    o += "]";
+  }
   o += ",\"heap\":" + String(ESP.getFreeHeap()) + "}";   // TLS needs ~40 KB; a bench number worth having
   server.send(200, "application/json", o);
 }
@@ -919,9 +1139,12 @@ void handleProbe() {
 
 void handleSave() {
   if (!requireWrite()) return;
-  static const char* const allowed[] = { "ssid", "pass" };
+  static const char* const allowed[] = { "ssid", "pass", "stay" };
   if (!rejectUnexpectedArgs(allowed, sizeof(allowed) / sizeof(allowed[0]))) return;
   String ssid = server.arg("ssid");
+  // stay=1 adds the network to the list without restarting: saving the
+  // makerspace network while at home must not knock the clock off the home one.
+  bool stay = server.arg("stay") == "1";
   String pass = server.arg("pass");
   // 802.11 caps these. Over-length stores fine and then never associates, which
   // looks like a wrong password forever.
@@ -933,23 +1156,44 @@ void handleSave() {
   // code discarded all three return values and told the user "Saved". The
   // device then rebooted, found nothing, and returned to the portal in a loop
   // that reported success on every pass.
-  bool ok = prefs.begin("wifi", false);
-  if (ok) ok = prefs.putString("ssid", ssid) > 0;
-  if (ok) {
-    // An empty password means an open network. It used to leave the previous
-    // password in place, so the clock could never join an open network after a
-    // secured one.
-    if (pass.isEmpty()) prefs.remove("pass");
-    else ok = prefs.putString("pass", pass) > 0;
-  }
-  prefs.end();
-
-  if (!ok) { sendJsonError(500, "could not write wifi settings to flash"); return; }
+  // Saving adds to the list (newest first) rather than replacing the one network.
+  if (!addNet(ssid, pass)) { sendJsonError(500, "could not write wifi settings to flash"); return; }
+  if (stay) { server.send(200, "application/json", "{\"ok\":true,\"stay\":true}"); return; }
 
   server.send(200, "application/json", "{\"ok\":true,\"host\":\"" + String(hostName) + "\"}");
   delay(600);
   confirmBeforeRestart();
   ESP.restart();
+}
+
+void handleForget() {
+  if (!requireWrite()) return;
+  static const char* const allowed[] = { "ssid" };
+  if (!rejectUnexpectedArgs(allowed, 1)) return;
+  bool found;
+  if (!forgetNet(server.arg("ssid"), found)) { sendJsonError(500, "could not write wifi settings to flash"); return; }
+  if (!found) { sendJsonError(404, "that network is not saved"); return; }
+  // Forgetting the network in use does not drop it now; the clock simply will
+  // not choose it next time it looks.
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// sec=N starts (or restarts) a countdown of N seconds, sec=0 cancels it, and
+// add=N extends a running one — for the print whose estimate was optimistic.
+void handleTimer() {
+  if (!requireWrite()) return;
+  static const char* const allowed[] = { "sec", "add" };
+  if (!rejectUnexpectedArgs(allowed, 2)) return;
+  long v;
+  if (server.hasArg("sec")) {
+    if (!readLongArg("sec", 0, TIMER_MAX_S, v)) return;
+    timerStart((uint32_t)v);
+  } else if (server.hasArg("add")) {
+    if (!readLongArg("add", 1, TIMER_MAX_S, v)) return;
+    uint32_t base = timerOn && !timerDoneMs ? timerLeftS() : 0;
+    timerStart((uint32_t)min<long>((long)base + v, (long)TIMER_MAX_S));
+  } else { sendJsonError(400, "sec or add is required"); return; }
+  server.send(200, "application/json", "{\"ok\":true" + timerJson() + "}");
 }
 
 // The web server runs in BOTH modes — portal and normal — so there is exactly
@@ -1102,7 +1346,7 @@ void handleFactoryReset() {
   // Every namespace this firmware writes. The bootloader and the app slots are
   // untouched — this is "forget everything", not "unflash".
   Preferences p;
-  for (const char* ns : { "disp", "wifi", "boots" }) {
+  for (const char* ns : { "disp", "wifi", "boots", "timer" }) {
     if (p.begin(ns, false)) { p.clear(); p.end(); }
   }
   server.send(200, "application/json", "{\"ok\":true}");
@@ -1164,6 +1408,8 @@ void startWeb() {
   server.on("/identify",    HTTP_POST, handleIdentify);
   server.on("/probe",       HTTP_POST, handleProbe);
   server.on("/save",        HTTP_POST, handleSave);
+  server.on("/forget",      HTTP_POST, handleForget);
+  server.on("/timer",       HTTP_POST, handleTimer);
   server.on("/factoryreset", HTTP_POST, handleFactoryReset);
   server.on("/reboot", HTTP_POST, [] {
     if (!requireWrite()) return;
@@ -1334,29 +1580,59 @@ void startNtp() {
   lastNtpTryMs = millis();
 }
 
-void readCreds(String& ssid, String& pass) {
-  prefs.begin("wifi", true);
-  ssid = prefs.getString("ssid", "");
-  pass = prefs.getString("pass", "");
-  prefs.end();
+// SCAN, THEN JOIN
+//   With several saved networks the clock has to pick one, and the only honest
+//   way is to look: an ASYNC scan (so the panel and the page keep running — a
+//   blocking one froze both for ~2 s), then begin() on the strongest saved SSID
+//   in sight. Nothing saved in sight, or the scan failed, falls back to the newest
+//   saved network, which covers a hidden SSID the scan cannot see.
+//   The scan is short and bounded, which matters under the portal: a station
+//   hunting continuously is what made the setup AP invisible in 1.2.1.
+bool joinScanning = false;
+
+/** Start a scan-then-join and return at once; serviceJoin() finishes it. */
+bool startJoin() {
+  if (!hasCreds()) return false;
+  WiFi.disconnect(false, false);     // a scan cannot run while an attempt is in progress
+  WiFi.scanDelete();
+  int16_t r = WiFi.scanNetworks(true, false, false, 120);
+  joinScanning = true;
+  if (r == WIFI_SCAN_FAILED) Serial.println("[WIFI] scan did not start; joining the newest network");
+  return true;
 }
 
-/** Begin an association with the saved network and return at once. */
-bool beginSta() {
-  String ssid, pass;
-  readCreds(ssid, pass);
-  if (ssid.isEmpty()) return false;
-  Serial.printf("[WIFI] connecting to %s\n", ssid.c_str());
-  WiFi.begin(ssid.c_str(), pass.c_str());
-  return true;
+void serviceJoin() {
+  if (!joinScanning) return;
+  int16_t n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return;
+  joinScanning = false;
+  String ss[NET_MAX], pp[NET_MAX];
+  uint8_t k = readNets(ss, pp);
+  if (!k) { WiFi.scanDelete(); return; }
+  int8_t best = -1;
+  int32_t bestRssi = INT32_MIN;
+  for (int16_t i = 0; i < n; i++) {
+    String seen = WiFi.SSID(i);
+    for (uint8_t j = 0; j < k; j++)
+      if (seen == ss[j] && WiFi.RSSI(i) > bestRssi) { best = j; bestRssi = WiFi.RSSI(i); }
+  }
+  WiFi.scanDelete();
+  if (best < 0) {
+    best = 0;
+    Serial.printf("[WIFI] no saved network in sight (%d seen); trying %s\n", n, ss[0].c_str());
+  } else {
+    Serial.printf("[WIFI] joining %s (%ld dBm, %u saved)\n", ss[best].c_str(), (long)bestRssi, k);
+  }
+  WiFi.begin(ss[best].c_str(), pp[best].c_str());
 }
 
 /** Boot-time association: one attempt, blocking with a spinner, so the common
  *  case (router up) gets the time on the panel as fast as possible. */
 bool tryConnect() {
-  if (!beginSta()) return false;
+  if (!startJoin()) return false;
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS) {
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TIMEOUT_MS + 4000) {   // + the scan
+    serviceJoin();
     paintFrame();
     delay(20);
   }
@@ -1390,7 +1666,7 @@ void onOnline() {
   wasOnline = true;
   everOnline = true;
   lastConnectedMs = millis();
-  Serial.println("[STATE] -> online");
+  Serial.printf("[STATE] -> online on %s\n", WiFi.SSID().c_str());
   startWeb();
   startMdns();
   startOta();
@@ -1531,10 +1807,12 @@ void setup() {
 void loop() {
   uint32_t now = millis();
   confirmImage();                    // uptime-based; every branch reaches it
+  timerRestore();                    // once, when the time first becomes valid
 
   if (portalUp) {
     dns.processNextRequest();
     pumpWeb();
+    serviceJoin();
     if (WiFi.status() == WL_CONNECTED) {
       // The portal is not a dead end. The background attempt landed: tear the
       // AP down and come up as a normal clock.
@@ -1544,6 +1822,7 @@ void loop() {
       // The burst is over and it did not land: stop scanning so the AP is
       // visible again until the next burst.
       portalTryUntilMs = 0;
+      if (joinScanning) { joinScanning = false; WiFi.scanDelete(); }
       WiFi.disconnect(false, false);
       Serial.println("[WIFI] saved network not found; portal visible again");
     } else if (!portalTryUntilMs && now - lastPortalTryMs > PORTAL_RETRY_MS) {
@@ -1556,7 +1835,7 @@ void loop() {
       bool phoneAttached = WiFi.softAPgetStationNum() > 0;
       if (!phoneAttached || now - lastForcedMs > 5 * PORTAL_RETRY_MS) {
         lastForcedMs = now;
-        if (hasCreds() && beginSta()) portalTryUntilMs = now + PORTAL_TRY_MS;
+        if (startJoin()) portalTryUntilMs = now + PORTAL_TRY_MS;
       }
     }
     paintFrame();                    // the time, if known, not "AP" forever
@@ -1567,10 +1846,13 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     wasOnline = false;
     pumpWeb();
+    serviceJoin();
+    // Scan-then-join rather than reconnect(): the network that dropped may not be
+    // the one in range any more — the clock was carried to the other place.
     if (now - lastReconnectMs > RECONNECT_EVERY_MS) {
       lastReconnectMs = now;
       Serial.println("[WIFI] reconnecting");
-      WiFi.reconnect();
+      startJoin();
     }
     // Only after a genuinely long outage is it worth offering the portal — and
     // even then it keeps retrying in the background. timeValid is NOT cleared:
@@ -1625,7 +1907,8 @@ void loop() {
   // INSTALL mode: once, in the small hours, if the last check found something.
   // Re-checked immediately before installing, so a release pulled in the
   // meantime is never installed.
-  if (cfg.upd == UPD_INSTALL && updAvail && !wiringOwnsPanel()) {
+  // Never while a countdown runs: a restart mid-print is the one thing a timer must not do.
+  if (cfg.upd == UPD_INSTALL && updAvail && !wiringOwnsPanel() && !timerOn) {
     struct tm lt;
     if (getLocalTime(&lt, 0) && lt.tm_hour == AUTOINSTALL_HOUR && lt.tm_yday != lastInstallYday) {
       lastInstallYday = lt.tm_yday;
@@ -1642,7 +1925,7 @@ void loop() {
   // The ticker paints straight into the buffer on its own path, so the gate in
   // showTime() does not cover it. A BTC scroll arriving mid-wizard would be a
   // baffling thing to be asked to identify.
-  if (cfg.tickMins && !wiringOwnsPanel() &&
+  if (cfg.tickMins && !wiringOwnsPanel() && !timerOn &&
       now - lastTickMs > cfg.tickMins * 60000UL) {
     lastTickMs = now;
     struct tm t;

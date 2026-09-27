@@ -38,7 +38,7 @@ legend{font-size:.72rem;text-transform:uppercase;letter-spacing:.09em;color:var(
 .row output{color:var(--mut);font-variant-numeric:tabular-nums;font-size:.85rem;min-width:2.6rem;text-align:right}
 input[type=range]{flex:2;accent-color:var(--acc)}
 input[type=color]{width:3.2rem;height:2.1rem;padding:0;border:1px solid var(--line);border-radius:.4rem;background:none}
-input[type=text],input[type=password],select{flex:2;background:#151920;color:var(--fg);border:1px solid var(--line);
+input[type=text],input[type=password],input[type=number],select{flex:2;background:#151920;color:var(--fg);border:1px solid var(--line);
   border-radius:.4rem;padding:.45rem .6rem;font:inherit;font-size:.9rem;min-width:0}
 .seg{display:flex;gap:.3rem;flex-wrap:wrap}
 .seg button{flex:1;padding:.5rem;border:1px solid var(--line);background:#151920;color:var(--fg);
@@ -50,11 +50,23 @@ input[type=text],input[type=password],select{flex:2;background:#151920;color:var
 .note{color:var(--mut);font-size:.78rem;border-top:1px solid var(--line);padding-top:1rem;margin-top:.5rem}
 .note b{color:var(--fg);font-weight:600}
 .flat{border:0;padding:0;margin:.4rem 0 0}
+.big{font:600 2rem/1.2 ui-monospace,Menlo,monospace;letter-spacing:.04em;margin:.2rem 0 .6rem}
+.nets{list-style:none;padding:0;margin:0 0 .6rem}
+.nets li{display:flex;justify-content:space-between;align-items:center;padding:.4rem 0;border-bottom:1px solid var(--line)}
+.nets button{padding:.25rem .6rem;border:1px solid #5a2a2a;background:#151920;color:var(--bad);border-radius:.4rem;font:inherit;font-size:.8rem;cursor:pointer}
 </style>
 <div class=w>
 <h1 id=title>mini7seg clock</h1>
 <p class=sub id=stat>&nbsp;</p>
 <p class=err id=err></p>
+
+<fieldset><legend>Countdown</legend>
+<div class=big id=tleft>off</div>
+<div class=row><label for=th>Hours / minutes</label><input type=number id=th min=0 max=16 placeholder=h style="flex:1"><input type=number id=tmn min=0 max=999 placeholder=min style="flex:1"></div>
+<div class=seg><button id=tgo>Start</button><button id=tplus>+10 min</button><button id=tstop class=warn>Cancel</button></div>
+<div class=seg style="margin-top:.4rem" id=tpre><button data-m=15>15m</button><button data-m=30>30m</button><button data-m=60>1h</button><button data-m=120>2h</button><button data-m=240>4h</button></div>
+<p class="note flat">Takes the display over from the clock. Under 100 minutes it reads <b>MM.SS</b>; longer, <b>MMM.T</b> (minutes, then tens of seconds). The last minute counts down in red, then <b>donE</b> flashes for an hour. Runs without WiFi, and survives a power blip once the clock knows the time.</p>
+</fieldset>
 
 <fieldset><legend>Hue source</legend>
 <div class=modes id=hue>
@@ -109,10 +121,11 @@ input[type=text],input[type=password],select{flex:2;background:#151920;color:var
 </fieldset>
 
 <fieldset><legend>Network</legend>
+<ul class=nets id=nets></ul>
 <div class=row><label for=ssid>WiFi network</label><input type=text id=ssid maxlength=32 spellcheck=false autocapitalize=off autocorrect=off></div>
 <div class=row><label for=pass>Password</label><input type=password id=pass maxlength=63 placeholder="blank for an open network"></div>
-<div class=seg><button id=netsave>Save network and restart</button></div>
-<p class="note flat" id=netn>Changing networks restarts the clock. If it cannot join the new network, it raises its own <b>setup network</b> after about three minutes so you can try again. (A network that drops after working gets ten minutes to come back first.)</p>
+<div class=seg><button id=netsave>Add network</button></div>
+<p class="note flat" id=netn>The clock remembers up to five networks and joins the strongest one it can see whenever it starts or loses its connection &mdash; so add the other places you take it before you go. Adding does not restart it. If none is in range it raises its own <b>setup network</b> after about three minutes (ten, if a network was working and dropped).</p>
 <div class=seg style="margin-top:.8rem"><button id=freset class=warn>Factory reset</button></div>
 </fieldset>
 
@@ -155,7 +168,7 @@ const TZ=[['US Pacific','PST8PDT,M3.2.0,M11.1.0'],['US Mountain','MST7MDT,M3.2.0
 // The compiled-in default spelled the switch hour explicitly; treat it as US Pacific.
 const tzAlias=v=>v==='PST8PDT,M3.2.0/2,M11.1.0/2'?'PST8PDT,M3.2.0,M11.1.0':v;
 $('tzsel').innerHTML=TZ.map(t=>'<option value="'+t[1]+'">'+t[0]+'</option>').join('')+'<option value="">Custom...</option>';
-function stat(d){const s=[d.time,d.ip||'no ip',d.online?'online':'offline'];
+function stat(d){timer(d);nets(d);const s=[d.time,d.ip||'no ip',d.online?'online'+(d.ssid?' on '+d.ssid:''):'offline'];
   if(d.syncMin!=null)s.push('synced '+(d.syncMin<1?'just now':d.syncMin+' min ago'));else if(!d.timeValid)s.push('waiting for NTP');
   $('stat').textContent=s.join('  -  ')}
 function paint(d){S=d;
@@ -250,12 +263,35 @@ $('tz').onchange=e=>{const v=e.target.value.trim();if(v)send({tz:v})};
 $('name').onchange=e=>{const v=e.target.value.trim().toLowerCase();if(v)send({name:v})};
 $('netsave').onclick=()=>{const ssid=$('ssid').value.trim(),pass=$('pass').value;
   if(!ssid){$('err').textContent='Enter the network name first.';return}
-  if(!confirm('Join "'+ssid+'" and restart the clock?'))return;
-  $('netn').textContent='Saving and restarting...';
-  fetch('/save?'+new URLSearchParams({ssid,pass}),H).then(r=>r.json()).then(j=>{
-    $('netn').textContent=j.ok?'Saved. Restarting - the clock joins '+ssid+' and comes back at '+(S.host||'mini7seg')+'.local.':'Not saved: '+(j.error||'unknown')})
-  .catch(()=>{$('netn').textContent='Restarting...'})};
-$('freset').onclick=()=>{if(!confirm('Forget the WiFi network, the wiring map and every setting, then restart?'))return;
+  fetch('/save?'+new URLSearchParams({ssid,pass,stay:1}),H).then(r=>r.json()).then(j=>{
+    if(j.ok){$('ssid').value='';$('pass').value='';$('err').textContent='';reload()}
+    else $('err').textContent='Not saved: '+(j.error||'unknown')})
+  .catch(()=>{$('err').textContent='The clock did not answer.'})};
+// Saved networks. Passwords never leave the clock; only the names are listed.
+function nets(d){if(!d.nets)return;const u=$('nets');u.innerHTML='';
+  d.nets.forEach(n=>{const li=document.createElement('li'),sp=document.createElement('span'),b=document.createElement('button');
+    sp.textContent=n+(n===d.ssid?'  (connected)':'');b.textContent='Forget';
+    b.onclick=()=>{if(!confirm('Forget "'+n+'"?'))return;
+      fetch('/forget?'+new URLSearchParams({ssid:n}),H).then(r=>r.json()).then(j=>{if(!j.ok)$('err').textContent='Not forgotten: '+(j.error||'unknown');reload()})};
+    li.append(sp,b);u.appendChild(li)});
+  if(!d.nets.length)u.innerHTML='<li>No saved networks.</li>'}
+// Countdown. The clock owns the time left; the page ticks locally between polls.
+let tEnd=0,tDone=false;
+function timer(d){if(!('timerLeft' in d))return;tDone=!!d.timerDone;tEnd=d.timerLeft==null?0:Date.now()+d.timerLeft*1000;tshow()}
+function tshow(){const el=$('tleft');if(tDone){el.textContent='done';return}
+  if(!tEnd){el.textContent='off';return}
+  const s=Math.max(0,Math.ceil((tEnd-Date.now())/1000)),h=Math.floor(s/3600),m=Math.floor(s/60)%60,x=s%60;
+  el.textContent=(h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0')}
+setInterval(tshow,1000);
+function tsend(q){fetch('/timer?'+new URLSearchParams(q),H).then(r=>r.json()).then(j=>{
+  if(j.ok===false)$('err').textContent='Timer: '+(j.error||'unknown');else{$('err').textContent='';timer(j)}})
+  .catch(()=>{$('err').textContent='The clock did not answer.'})}
+$('tgo').onclick=()=>{const s=(+$('th').value||0)*3600+(+$('tmn').value||0)*60;
+  if(s<=0){$('err').textContent='Enter hours and/or minutes first.';return}tsend({sec:s})};
+$('tplus').onclick=()=>tsend({add:600});
+$('tstop').onclick=()=>tsend({sec:0});
+$('tpre').onclick=e=>{const m=+e.target.dataset.m;if(m)tsend({sec:m*60})};
+$('freset').onclick=()=>{if(!confirm('Forget every saved WiFi network, the wiring map and every setting, then restart?'))return;
   $('netn').textContent='Resetting...';
   fetch('/factoryreset',H).then(r=>r.json()).then(j=>{$('netn').textContent=j.ok?'Reset. The clock restarts and raises its setup network.':'Not reset: '+(j.error||'unknown')})
   .catch(()=>{$('netn').textContent='Reset sent; the clock is restarting.'})};
